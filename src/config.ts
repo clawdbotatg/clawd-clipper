@@ -26,6 +26,10 @@ export const config = {
   // Clip-selection model. Direct Anthropic by default; Bankr gateway fallback.
   anthropicModel: env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
   bankrModel: env("CLIPPER_BANKR_MODEL") || "claude-opus-4.7",
+
+  // Adversarial judge re-rank model. Defaults to the selection model; set to a
+  // cheaper one (e.g. a Sonnet) to trim credits on the second-opinion pass.
+  judgeModel: env("CLIPPER_JUDGE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
 } as const;
 
 export function alchemyRpcUrl(): string {

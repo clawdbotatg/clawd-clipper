@@ -48,10 +48,16 @@ export async function writeGallery(opts: {
       <div class="vid"><video controls preload="none" src="clips/${esc(c.file)}"></video></div>
       <div class="meta">
         <div class="row">
-          <span class="score">${c.score}</span>
+          <span class="score${c.verdict === "cut" ? " cut" : ""}">${c.finalScore ?? c.score}</span>
           <h2>${esc(c.title)}</h2>
         </div>
+        ${
+          c.judgeScore != null
+            ? `<p class="scores">pick ${c.score} · judge ${c.judgeScore}${c.verdict === "cut" ? ` · <span class="verdict">judge would cut</span>` : ""}</p>`
+            : ""
+        }
         <p class="reason">${esc(c.reason)}</p>
+        ${c.critique ? `<p class="critique">⚖︎ ${esc(c.critique)}</p>` : ""}
         <p class="tags">${c.kind ? `<b>${esc(c.kind)}</b> · ` : ""}${c.tags.map(esc).join(" · ")}</p>
         <p class="time">${mmss(c.start)}–${mmss(c.end)} · ${c.duration}s · <a href="clips/${esc(c.file)}" download>download</a> · <a href="clips/${esc(c.srt)}">srt</a></p>
         <details><summary>transcript</summary><p class="text">${esc(c.text)}</p></details>
@@ -81,7 +87,11 @@ export async function writeGallery(opts: {
   .row { display: flex; align-items: baseline; gap: 10px; }
   .row h2 { margin: 0; font-size: 14px; line-height: 1.3; }
   .score { flex: none; font-weight: 700; color: #0e0e10; background: #7dd3fc; border-radius: 6px; padding: 1px 8px; font-size: 13px; }
+  .score.cut { background: #f0a0a0; }
+  .scores { color: #6f6f78; font-size: 11px; margin: 6px 0 0; }
+  .verdict { color: #f0a0a0; }
   .reason { color: #c4c4cc; margin: 8px 0 6px; }
+  .critique { color: #d8b48a; font-size: 12px; margin: 4px 0; }
   .tags { color: #8a8a93; font-size: 12px; margin: 4px 0; }
   .tags b { color: #7dd3fc; }
   .time { color: #6f6f78; font-size: 12px; margin: 6px 0 0; }

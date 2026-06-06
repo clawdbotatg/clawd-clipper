@@ -4,7 +4,7 @@ import { config } from "./config.js";
 // local setup); fall back to Bankr's OpenClaw gateway (OpenAI-compatible,
 // X-API-Key) — the same two-provider arrangement slop's meta-ai.ts uses.
 
-async function callAnthropic(prompt: string): Promise<string | null> {
+async function callAnthropic(prompt: string, model: string): Promise<string | null> {
   if (!config.anthropicApiKey) return null;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -16,7 +16,7 @@ async function callAnthropic(prompt: string): Promise<string | null> {
     // No `temperature`: newer Anthropic models reject it as deprecated
     // (slop's own meta-ai.ts likewise omits it on the direct path).
     body: JSON.stringify({
-      model: config.anthropicModel,
+      model,
       max_tokens: 8192,
       messages: [{ role: "user", content: prompt }],
     }),
@@ -42,7 +42,6 @@ async function callBankr(prompt: string): Promise<string | null> {
     body: JSON.stringify({
       model: config.bankrModel,
       max_tokens: 8192,
-      temperature: 0.3,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -54,9 +53,9 @@ async function callBankr(prompt: string): Promise<string | null> {
   return data?.choices?.[0]?.message?.content?.trim() || null;
 }
 
-export async function complete(prompt: string): Promise<string> {
-  const out = (await callAnthropic(prompt)) ?? (await callBankr(prompt));
-  if (!out) throw new Error("no clip-selection model available (set ANTHROPIC_API_KEY or BANKR_API_KEY)");
+export async function complete(prompt: string, model: string = config.anthropicModel): Promise<string> {
+  const out = (await callAnthropic(prompt, model)) ?? (await callBankr(prompt));
+  if (!out) throw new Error("no model available (set ANTHROPIC_API_KEY or BANKR_API_KEY)");
   return out;
 }
 

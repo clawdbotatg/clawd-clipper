@@ -12,17 +12,25 @@ const LEAD = 0.4; // seconds of breathing room before the first word
 const TAIL = 0.7; // and after the last
 const OVERLAP_DROP = 0.5; // drop a lower-scored clip overlapping a kept one by >50%
 
-export type Clip = {
-  rank: number;
+export type ResolvedClip = {
   title: string;
   reason: string;
   kind: string;
   tags: string[];
-  score: number;
+  score: number; // selection model's own shareability estimate (0-100)
   start: number;
   end: number;
   duration: number;
   text: string; // transcript inside the clip window
+  // Filled in by the adversarial judge pass (judge.ts), if run:
+  judgeScore?: number; // independent, skeptical re-score (0-100)
+  critique?: string; // the judge's single biggest knock against the clip
+  verdict?: "keep" | "cut";
+  finalScore?: number; // blend of score + judgeScore used for the final rank
+};
+
+export type Clip = ResolvedClip & {
+  rank: number;
   file: string; // mp4 filename (relative to clips dir)
   srt: string; // srt filename
 };
@@ -66,10 +74,7 @@ function wordsBetween(words: Word[], start: number, end: number): string {
 }
 
 /** Resolve candidates to concrete time windows, dropping unanchorable / out-of-range ones. */
-export function resolveCandidates(
-  candidates: RawCandidate[],
-  transcript: Transcript,
-): (Omit<Clip, "rank" | "file" | "srt"> & { start: number; end: number })[] {
+export function resolveCandidates(candidates: RawCandidate[], transcript: Transcript): ResolvedClip[] {
   const resolved = candidates
     .map(c => {
       const a = findSpan(transcript, c.startQuote, "first");
@@ -138,7 +143,7 @@ function buildSrt(words: Word[], start: number, end: number): string {
 export async function buildClips(opts: {
   source: string;
   transcript: Transcript;
-  resolved: ReturnType<typeof resolveCandidates>;
+  resolved: ResolvedClip[];
   clipsDir: string;
   limit?: number;
   log?: (m: string) => void;
@@ -148,7 +153,10 @@ export async function buildClips(opts: {
   // filenames) don't linger as orphans.
   await rm(opts.clipsDir, { recursive: true, force: true });
   await mkdir(opts.clipsDir, { recursive: true });
-  const list = opts.limit ? opts.resolved.slice(0, opts.limit) : opts.resolved;
+  // Final order = judge-blended score when the judge ran, else the
+  // selection score. (resolveCandidates already de-overlapped on score.)
+  const ranked = [...opts.resolved].sort((a, b) => (b.finalScore ?? b.score) - (a.finalScore ?? a.score));
+  const list = opts.limit ? ranked.slice(0, opts.limit) : ranked;
   const clips: Clip[] = [];
   for (let i = 0; i < list.length; i++) {
     const c = list[i]!;
@@ -156,7 +164,7 @@ export async function buildClips(opts: {
     const base = `${rank.toString().padStart(2, "0")}_${slugify(c.title)}`;
     const file = `${base}.mp4`;
     const srt = `${base}.srt`;
-    log(`clip ${rank}/${list.length} [${c.score}] ${c.title} (${c.duration}s)`);
+    log(`clip ${rank}/${list.length} [${c.finalScore ?? c.score}] ${c.title} (${c.duration}s)`);
     await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end);
     await writeFile(join(opts.clipsDir, srt), buildSrt(opts.transcript.words, c.start, c.end));
     clips.push({ rank, ...c, file, srt });

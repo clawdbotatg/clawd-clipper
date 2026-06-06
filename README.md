@@ -66,8 +66,16 @@ The pipeline, stage by stage (`src/`):
 6. **`clips.ts`** — pads, clamps to 10–40 s, de-overlaps (keeps the
    higher-scored clip), then `ffmpeg`-cuts each window (re-encoded for
    frame-accurate boundaries) and writes a clip-relative `.srt`.
-7. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
-   zero-dependency `index.html` that plays every clip inline, best first.
+7. **`judge.ts`** — an **adversarial re-rank**. One batched second-opinion call
+   that sees only each clip's actual words (not the selection model's title /
+   reason / score, so it can't be anchored by the pitch), assumes the clip is
+   watched *cold while scrolling*, finds the single biggest reason it would
+   flop, and re-scores it stingily. The final rank blends the two scores
+   (`finalScore = 0.35·pick + 0.65·judge`). One extra model call per episode
+   (not one per clip), cached to `judge.json`, skippable with `--no-judge`.
+8. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
+   zero-dependency `index.html` that plays every clip inline, best first, with
+   the pick/judge scores and the judge's critique on each card.
 
 ## Setup
 
@@ -94,7 +102,8 @@ yarn clip <slug>                 # resolve via contract, then clip
 yarn clip <slug> --manifest CID  # skip the chain, use a manifest CID directly
 yarn clip <slug> --limit 12      # only render the top N clips
 yarn clip <slug> --target 25     # target clip length in seconds (10–40)
-yarn clip <slug> --force         # ignore caches (re-download, re-transcribe)
+yarn clip <slug> --no-judge      # skip the adversarial judge re-rank
+yarn clip <slug> --force         # ignore caches (re-download, re-transcribe, re-judge)
 ```
 
 Output lands in `out/<slug>/`:
@@ -103,13 +112,15 @@ Output lands in `out/<slug>/`:
 out/binji-x/
   source.mp4          # the downloaded episode (gitignored)
   transcript.json     # word + segment timestamps (cached)
+  candidates.json     # raw LLM clip picks (cached)
+  judge.json          # adversarial verdicts, keyed by clip content (cached)
   clips/
-    01_<title>.mp4    # ranked, highest shareability first
+    01_<title>.mp4    # ranked, highest blended score first
     01_<title>.srt
     02_<title>.mp4
     …
-  index.json          # ranked clip metadata
-  index.html          # inline gallery, sorted by score
+  index.json          # ranked clip metadata (pick + judge scores, critiques)
+  index.html          # inline gallery, sorted by final score
 ```
 
 ## Notes & knobs
@@ -124,8 +135,10 @@ out/binji-x/
 
 ## Roadmap
 
+- **Snap clip ends to natural beats.** The judge keeps flagging clips that "end
+  mid-sentence / on a vague word" — snap the end to the end of the whisper
+  segment containing the end word so clips land cleanly.
 - Burned-in captions and a 9:16 social reframe (v1 ships clean landscape + sidecar `.srt`).
-- A second adversarial "judge" pass to re-rank candidates head-to-head.
 - Fold clips into the slop deploy so they render at the bottom of the slug page.
 
 License: MIT.

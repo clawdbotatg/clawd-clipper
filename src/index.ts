@@ -4,6 +4,7 @@ import { selectCandidates, type RawCandidate } from "./candidates.js";
 import { buildClips, resolveCandidates } from "./clips.js";
 import { downloadFile } from "./download.js";
 import { writeGallery } from "./gallery.js";
+import { applyVerdicts, clipKey, getVerdicts, type JudgeVerdict } from "./judge.js";
 import { resolveBySlug, resolveByManifestCid, type ResolvedEpisode } from "./resolve.js";
 import { transcribeVideo } from "./transcribe.js";
 
@@ -13,6 +14,7 @@ import { transcribeVideo } from "./transcribe.js";
 //   yarn clip <slug> --manifest CID  skip the chain, use a manifest CID
 //   yarn clip <slug> --limit 12      cap the number of clips rendered
 //   yarn clip <slug> --target 25     target clip length in seconds (10-40)
+//   yarn clip <slug> --no-judge      skip the adversarial judge re-rank
 //   yarn clip <slug> --force         ignore caches (re-download, re-transcribe)
 
 type Args = {
@@ -20,23 +22,26 @@ type Args = {
   manifest?: string;
   limit?: number;
   target?: number;
+  judge: boolean;
   force: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false };
+  const out: Partial<Args> = { force: false, judge: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
+    else if (a === "--no-judge") out.judge = false;
     else if (a === "--manifest") out.manifest = argv[++i];
     else if (a === "--limit") out.limit = Number(argv[++i]);
     else if (a === "--target") out.target = Number(argv[++i]);
     else if (a.startsWith("--")) throw new Error(`unknown flag: ${a}`);
     else positional.push(a);
   }
-  if (!positional[0]) throw new Error("usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--force]");
-  return { slug: positional[0], ...out, force: out.force ?? false };
+  if (!positional[0])
+    throw new Error("usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--force]");
+  return { slug: positional[0], ...out, judge: out.judge ?? true, force: out.force ?? false };
 }
 
 async function main() {
@@ -92,8 +97,32 @@ async function main() {
     log(`  model proposed ${candidates.length} candidates`);
   }
 
-  const resolvedCands = resolveCandidates(candidates, transcript);
+  let resolvedCands = resolveCandidates(candidates, transcript);
   log(`  ${resolvedCands.length} anchored to real timestamps + in range`);
+
+  if (args.judge && resolvedCands.length) {
+    log(`\n▸ adversarial judge re-rank…`);
+    // Cache verdicts keyed by clip content (judge.json) so re-runs are free.
+    const judgePath = join(outDir, "judge.json");
+    let verdicts: Record<string, JudgeVerdict> = {};
+    if (!args.force) {
+      try {
+        verdicts = JSON.parse(await readFile(judgePath, "utf8")) as Record<string, JudgeVerdict>;
+      } catch {
+        /* no cache */
+      }
+    }
+    const allCovered = resolvedCands.every(c => verdicts[clipKey(c)]);
+    if (allCovered && Object.keys(verdicts).length) {
+      log(`  loaded cached verdicts`);
+    } else {
+      verdicts = await getVerdicts(resolvedCands);
+      await writeFile(judgePath, JSON.stringify(verdicts, null, 2));
+    }
+    resolvedCands = applyVerdicts(resolvedCands, verdicts);
+    const cut = resolvedCands.filter(c => c.verdict === "cut").length;
+    log(`  judged ${resolvedCands.length} clips · ${cut} flagged "cut" · re-ranked by blended score`);
+  }
 
   log(`\n▸ cutting clips…`);
   const clips = await buildClips({
