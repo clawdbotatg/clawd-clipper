@@ -63,9 +63,12 @@ The pipeline, stage by stage (`src/`):
    off the real start/end times. This is the same hallucination-proof trick
    slop's `meta-ai.ts` uses for chapters: a quote that can't be found is
    dropped, never faked, so a clip's boundaries are always real spoken words.
-6. **`clips.ts`** — pads, clamps to 10–40 s, de-overlaps (keeps the
-   higher-scored clip), then `ffmpeg`-cuts each window (re-encoded for
-   frame-accurate boundaries) and writes a clip-relative `.srt`.
+6. **`clips.ts`** — snaps each edge to a natural beat (the enclosing sentence
+   boundary via whisper's punctuation, walking across continuation segments,
+   with a silence-gap fallback) so clips don't begin/end mid-phrase; pads,
+   clamps to 10–40 s (a length-cap trim also lands on a boundary), de-overlaps
+   (keeps the higher-scored clip), then `ffmpeg`-cuts each window (re-encoded
+   for frame-accurate boundaries) and writes a clip-relative `.srt`.
 7. **`judge.ts`** — an **adversarial re-rank**. One batched second-opinion call
    that sees only each clip's actual words (not the selection model's title /
    reason / score, so it can't be anchored by the pitch), assumes the clip is
@@ -135,9 +138,6 @@ out/binji-x/
 
 ## Roadmap
 
-- **Snap clip ends to natural beats.** The judge keeps flagging clips that "end
-  mid-sentence / on a vague word" — snap the end to the end of the whisper
-  segment containing the end word so clips land cleanly.
 - Burned-in captions and a 9:16 social reframe (v1 ships clean landscape + sidecar `.srt`).
 - Fold clips into the slop deploy so they render at the bottom of the slug page.
 

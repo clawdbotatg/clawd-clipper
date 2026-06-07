@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { findSpan } from "./anchor.js";
 import type { RawCandidate } from "./candidates.js";
 import { cutClip } from "./ffmpeg.js";
-import type { Transcript, Word } from "./transcribe.js";
+import type { Segment, Transcript, Word } from "./transcribe.js";
 
 // Bounds + padding for a finished clip.
 const MIN = 10;
@@ -11,6 +11,11 @@ const MAX = 40;
 const LEAD = 0.4; // seconds of breathing room before the first word
 const TAIL = 0.7; // and after the last
 const OVERLAP_DROP = 0.5; // drop a lower-scored clip overlapping a kept one by >50%
+// Snap the cut to the enclosing whisper segment's boundary so clips begin and
+// end on a natural sentence beat instead of mid-phrase — but never reach more
+// than this far for a boundary (guards against a long run-on segment ballooning
+// the clip).
+const SNAP_MAX = 6;
 
 export type ResolvedClip = {
   title: string;
@@ -43,17 +48,31 @@ const slugify = (s: string) =>
     .replace(/^-+|-+$/g, "")
     .slice(0, 48) || "clip";
 
-function clamp(start: number, end: number, duration: number): { start: number; end: number } | null {
-  let s = Math.max(0, start - LEAD);
-  let e = Math.min(duration, end + TAIL);
+// Note: snap helpers (snapStart/snapEnd/snapEndDown) are defined below and used
+// by makeWindow — function declarations hoist, so order here is cosmetic.
+
+/**
+ * Turn anchored word times into a final clip window: snap both edges to
+ * sentence/pause boundaries, add breathing room, then enforce MIN/MAX — and
+ * when MAX forces a trim, land that trim on a boundary too rather than
+ * mid-word. Returns null if the clip can't reach MIN (e.g. near a media edge).
+ */
+function makeWindow(transcript: Transcript, rawStart: number, rawEnd: number): { start: number; end: number } | null {
+  const duration = transcript.duration;
+  let s = Math.max(0, snapStart(transcript, rawStart) - LEAD);
+  let e = Math.min(duration, snapEnd(transcript, rawEnd) + TAIL);
   if (e - s < MIN) {
-    // Too short: grow symmetrically toward MIN, respecting the media bounds.
     const need = MIN - (e - s);
     s = Math.max(0, s - need / 2);
     e = Math.min(duration, e + need / 2);
   }
-  if (e - s > MAX) e = s + MAX; // too long: trim the tail, keep the hook
-  if (e - s < MIN) return null; // couldn't reach MIN (clip near a media edge)
+  if (e - s > MAX) {
+    // Too long: pull the end back to the last natural boundary before the cap,
+    // falling back to a hard cut at the cap if none is close enough.
+    const target = s + MAX;
+    e = snapEndDown(transcript, target) ?? target;
+  }
+  if (e - s < MIN) return null;
   return { start: s, end: e };
 }
 
@@ -73,6 +92,89 @@ function wordsBetween(words: Word[], start: number, end: number): string {
   return joinWords(words.filter(w => w.start >= start - 0.05 && w.end <= end + 0.05));
 }
 
+// A clean cut lands on a sentence boundary if one is near (whisper punctuates
+// its segment text), else on a silence gap, else not at all. whisper segment
+// boundaries alone are unreliable — they often break mid-sentence — so we walk
+// across continuation segments to the real sentence edge.
+const GAP = 0.45; // inter-word silence (s) that reads as a natural beat
+const endsSentence = (text: string) => /[.!?]["')\]]?$/.test(text.trim());
+
+// Index of the segment enclosing `t`, else the first segment ending after it.
+function segIndexAt(segments: Segment[], t: number): number {
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i]!;
+    if (t >= s.start - 0.25 && t <= s.end + 0.25) return i;
+  }
+  return segments.findIndex(s => s.end >= t);
+}
+
+// Start of the sentence containing `t` — walk back over segments whose
+// predecessor didn't end a sentence.
+function sentenceStart(segments: Segment[], t: number): number | null {
+  let i = segIndexAt(segments, t);
+  if (i < 0) return null;
+  while (i > 0 && !endsSentence(segments[i - 1]!.text)) i--;
+  return segments[i]!.start;
+}
+
+// End of the sentence containing `t` — walk forward over segments that don't
+// themselves end a sentence.
+function sentenceEnd(segments: Segment[], t: number): number | null {
+  let i = segIndexAt(segments, t);
+  if (i < 0) return null;
+  while (i < segments.length - 1 && !endsSentence(segments[i]!.text)) i++;
+  return segments[i]!.end;
+}
+
+// Nearest silence-gap edge on either side of `t` (fallback when no punctuation).
+function pauseBefore(words: Word[], t: number): number | null {
+  for (let i = words.length - 1; i > 0; i--) {
+    const w = words[i]!;
+    if (w.start <= t && w.start - words[i - 1]!.end >= GAP) return w.start;
+  }
+  return null;
+}
+function pauseAfter(words: Word[], t: number): number | null {
+  for (let i = 0; i < words.length - 1; i++) {
+    const w = words[i]!;
+    if (w.end >= t && words[i + 1]!.start - w.end >= GAP) return w.end;
+  }
+  return null;
+}
+
+/** Pull the clip start back to its sentence start (or a prior pause), ≤ SNAP_MAX. */
+function snapStart(transcript: Transcript, t: number): number {
+  const s = sentenceStart(transcript.segments, t);
+  if (s != null && s <= t && t - s <= SNAP_MAX) return s;
+  const p = pauseBefore(transcript.words, t);
+  if (p != null && p <= t && t - p <= SNAP_MAX) return p;
+  return t;
+}
+
+/** Push the clip end out to its sentence end (or a following pause), ≤ SNAP_MAX. */
+function snapEnd(transcript: Transcript, t: number): number {
+  const e = sentenceEnd(transcript.segments, t);
+  if (e != null && e >= t && e - t <= SNAP_MAX) return e;
+  const p = pauseAfter(transcript.words, t);
+  if (p != null && p >= t && p - t <= SNAP_MAX) return p;
+  return t;
+}
+
+/** Latest natural stop AT OR BEFORE `t` (sentence end, else pause), ≤ SNAP_MAX
+ *  back. Used to land a MAX-length trim on a boundary instead of mid-word. */
+function snapEndDown(transcript: Transcript, t: number): number | null {
+  let best: number | null = null;
+  for (const s of transcript.segments) {
+    if (s.end <= t + 0.05 && endsSentence(s.text) && (best == null || s.end > best)) best = s.end;
+  }
+  if (best != null && t - best <= SNAP_MAX) return best;
+  const w = transcript.words;
+  for (let i = w.length - 2; i >= 0; i--) {
+    if (w[i]!.end <= t && w[i + 1]!.start - w[i]!.end >= GAP && t - w[i]!.end <= SNAP_MAX) return w[i]!.end;
+  }
+  return null;
+}
+
 /** Resolve candidates to concrete time windows, dropping unanchorable / out-of-range ones. */
 export function resolveCandidates(candidates: RawCandidate[], transcript: Transcript): ResolvedClip[] {
   const resolved = candidates
@@ -80,10 +182,9 @@ export function resolveCandidates(candidates: RawCandidate[], transcript: Transc
       const a = findSpan(transcript, c.startQuote, "first");
       const b = findSpan(transcript, c.endQuote, "last");
       if (!a || !b) return null;
-      let lo = a.start;
-      let hi = b.end;
-      if (hi <= lo) return null; // end before start — bad anchor pair
-      const win = clamp(lo, hi, transcript.duration);
+      if (b.end <= a.start) return null; // end before start — bad anchor pair
+      // makeWindow snaps both edges to sentence/pause boundaries + bounds length.
+      const win = makeWindow(transcript, a.start, b.end);
       if (!win) return null;
       return {
         title: c.title,
