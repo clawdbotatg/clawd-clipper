@@ -328,18 +328,23 @@ export function findWindowBottom(f: RgbFrame, menuBar: Box): WindowBottom {
   }
   // The horizontal full-width magenta border (findBottomLine) is the most DIRECT
   // evidence of the real bottom. The side traces fade out early over the window's
-  // own video content, so a bottom backed by only ONE side that ended on no
-  // border of its own (its coverage `cov` is weaker than the horizontal line's)
-  // is unreliable — it usually stops far above the true edge, slicing through a
-  // face. So:
-  //   - BOTH sides agreeing → a real corner pair: trust it (it correctly beats a
-  //     false early horizontal line INSIDE the window, e.g. a sub-toolbar/divider);
-  //   - otherwise → prefer the horizontal border when it's confident and stronger
-  //     than the raw coverage where the lone side petered out.
-  // (When the lone side actually ended ON a border, `cov` is high and the guard
-  // `fb.score > cov` keeps that side bottom — we only override faint stubs.)
+  // own video content (and can also OVER-run past the bottom, down through e.g. a
+  // desktop icon dock below it). So we cross-check them against the border:
+  //   - ONE side only, ending on no border of its own (cov below the horizontal
+  //     line's confidence) → faint stub, usually far above the true edge (slicing
+  //     a face): take the horizontal border.
+  //   - BOTH sides agreeing AND a real border there (cov ≥ 0.5) → a true corner
+  //     pair: trust it (it correctly beats a false early line INSIDE the window,
+  //     e.g. a sub-toolbar/divider).
+  //   - BOTH sides agreeing but on a row with NO border (cov < 0.5) while the
+  //     horizontal scan found a confident border ABOVE them → the sides over-ran
+  //     together past the bottom (the dock/desktop below shares the frame colour):
+  //     pull up to the border. Guarded by `fb.y < bestY` + `fb.score ≥ 0.8` so a
+  //     far-below desktop line (lower y, weaker) never wins.
   const fb = findBottomLine(f, menuBar);
-  if (!bothAgree && fb.y > 0 && fb.score >= 0.8 && fb.score > cov) ((score = fb.score), (bestY = fb.y));
+  const weakSingle = !bothAgree && fb.y > 0 && fb.score >= 0.8 && fb.score > cov;
+  const overshoot = bothAgree && cov < 0.5 && fb.y > 0 && fb.y < bestY && fb.score >= 0.8;
+  if (weakSingle || overshoot) ((score = fb.score), (bestY = fb.y));
   else if ((bestY < 0 || score < 0.5) && fb.y > 0 && fb.score > score) ((score = fb.score), (bestY = fb.y));
   return { y: bestY, score: Math.round(score * 100) / 100, leftX: sides.leftX, rightX: sides.rightX, leftEnd: sides.leftEnd, rightEnd: sides.rightEnd };
 }
