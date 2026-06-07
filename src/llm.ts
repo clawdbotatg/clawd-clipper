@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { config } from "./config.js";
 
 // Clip-selection model access. Prefer direct Anthropic (its key is the common
@@ -57,6 +58,55 @@ export async function complete(prompt: string, model: string = config.anthropicM
   const out = (await callAnthropic(prompt, model)) ?? (await callBankr(prompt));
   if (!out) throw new Error("no model available (set ANTHROPIC_API_KEY or BANKR_API_KEY)");
   return out;
+}
+
+/**
+ * Vision completion: send a single image plus a text prompt and return the
+ * model's text reply. Direct-Anthropic only — the only configured vision-capable
+ * path (the Bankr text fallback isn't wired for images here), so this throws if
+ * ANTHROPIC_API_KEY is unset. Used to detect participant-tile geometry from a
+ * sampled video frame (see vertical.ts).
+ */
+export async function completeVision(
+  prompt: string,
+  imagePath: string,
+  model: string = config.anthropicModel,
+  mediaType: "image/png" | "image/jpeg" = "image/png",
+): Promise<string> {
+  if (!config.anthropicApiKey) throw new Error("vision needs ANTHROPIC_API_KEY (no vision fallback configured)");
+  const data = (await readFile(imagePath)).toString("base64");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": config.anthropicApiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`anthropic vision ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+  }
+  const json = (await res.json()) as { content?: { type: string; text?: string }[] };
+  const text = (json.content ?? [])
+    .filter(c => c.type === "text")
+    .map(c => c.text ?? "")
+    .join("")
+    .trim();
+  if (!text) throw new Error("anthropic vision returned no text");
+  return text;
 }
 
 /** Pull a JSON value out of the model's reply, tolerating ```fences``` and prose. */

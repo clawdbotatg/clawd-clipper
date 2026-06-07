@@ -30,6 +30,34 @@ export const config = {
   // Adversarial judge re-rank model. Defaults to the selection model; set to a
   // cheaper one (e.g. a Sonnet) to trim credits on the second-opinion pass.
   judgeModel: env("CLIPPER_JUDGE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+
+  // Caption-correction model (refine.ts). It needs strong context-reasoning to
+  // recover crypto/AI jargon + proper nouns from rough STT, so it defaults to
+  // the selection model rather than a cheaper one.
+  refineModel: env("CLIPPER_REFINE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+
+  // ffmpeg binaries. The everyday ops (probe / audio extract / plain cut) use
+  // the system `ffmpeg`. Burning styled captions needs libass, which the slim
+  // homebrew `ffmpeg` lacks — so the burn pass uses the keg-only `ffmpeg-full`
+  // (installed alongside, NOT symlinked onto PATH, so the shared system binary
+  // your other pipelines call is left untouched). Override either via env.
+  ffmpegBin: env("CLIPPER_FFMPEG_BIN") || "ffmpeg",
+  ffmpegFullBin: env("CLIPPER_FFMPEG_FULL_BIN") || "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+
+  // Burned-caption look — slop.computer theme: dark video, purple/pink text,
+  // the word being spoken pops white. ASS colours are &HAABBGGRR (AA=00 opaque,
+  // and the bytes are reversed from #RRGGBB). All tunable via env.
+  caption: {
+    font: env("CLIPPER_CAPTION_FONT") || "Menlo", // monospace, fits slop's code aesthetic; has a Bold face
+    scale: Number(env("CLIPPER_CAPTION_SCALE")) || 0.085, // font height as a fraction of video height
+    box: env("CLIPPER_CAPTION_BOX") !== "0", // draw a translucent band behind the line (off: CLIPPER_CAPTION_BOX=0)
+    boxColor: env("CLIPPER_CAPTION_BOX_COLOR") || "&H1A0A1F", // band fill — dark plum (&HBBGGRR)
+    boxAlpha: env("CLIPPER_CAPTION_BOX_ALPHA") || "&H55", // band transparency (&H00 opaque … &HFF clear)
+    base: env("CLIPPER_CAPTION_BASE") || "&H00E04DD2", // #D24DE0 purple-magenta — the resting word colour
+    active: env("CLIPPER_CAPTION_ACTIVE") || "&H00FFFFFF", // white — the word currently being said
+    outline: env("CLIPPER_CAPTION_OUTLINE") || "&H00200818", // #180820 near-black plum — outline for legibility
+    glow: env("CLIPPER_CAPTION_GLOW") || "&H00D85FE0", // #E05FD8 pink — outline halo on the live word only
+  },
 } as const;
 
 export function alchemyRpcUrl(): string {

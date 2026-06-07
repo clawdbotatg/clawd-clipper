@@ -68,7 +68,8 @@ The pipeline, stage by stage (`src/`):
    with a silence-gap fallback) so clips don't begin/end mid-phrase; pads,
    clamps to 10–40 s (a length-cap trim also lands on a boundary), de-overlaps
    (keeps the higher-scored clip), then `ffmpeg`-cuts each window (re-encoded
-   for frame-accurate boundaries) and writes a clip-relative `.srt`.
+   for frame-accurate boundaries), **burns in the karaoke captions** (8), and
+   writes a clip-relative `.srt`.
 7. **`judge.ts`** — an **adversarial re-rank**. One batched second-opinion call
    that sees only each clip's actual words (not the selection model's title /
    reason / score, so it can't be anchored by the pitch), assumes the clip is
@@ -76,9 +77,23 @@ The pipeline, stage by stage (`src/`):
    flop, and re-scores it stingily. The final rank blends the two scores
    (`finalScore = 0.35·pick + 0.65·judge`). One extra model call per episode
    (not one per clip), cached to `judge.json`, skippable with `--no-judge`.
-8. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
+8. **`refine.ts` + `ass.ts`** — captions, **better than raw STT**. whisper hears
+   a crypto/AI show through a generic ear (`GPT 4 0`, `Clawd` vs `Claude Code`
+   vs the model `Claude`, mangled proper nouns). One batched Claude call — fed
+   the episode's own AI meta plus a domain glossary (`refine.ts`) — returns only
+   the **edits** it wants to make, as spans of source-word indices to replace.
+   Everything it doesn't touch passes through unchanged, and an out-of-range or
+   overlapping edit is dropped individually, so word-level **timing is never
+   faked** (the same anchor-to-real-words discipline as 5) and the worst case is
+   plain raw STT. Cached to `captions.json`. `ass.ts` then renders a karaoke
+   `.ass` in the slop theme — purple/pink words, the one being spoken popping
+   white — which libass burns into the clip in 6. Skip with `--no-refine`
+   (raw STT) or `--no-burn` (sidecar `.srt` only, clean video). The glossary at
+   the top of `refine.ts` is where you teach the system new vocabulary.
+9. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
    zero-dependency `index.html` that plays every clip inline, best first, with
-   the pick/judge scores and the judge's critique on each card.
+   the pick/judge scores, the judge's critique, and the corrected caption text
+   on each card.
 
 ## Setup
 
@@ -98,6 +113,18 @@ Keys (see `.env.example`):
 
 > Per the repo's RPC rules, **never** use a public RPC — Alchemy only.
 
+You also need **ffmpeg** (cutting / probing / audio extraction) and, for the
+burned-in captions, an ffmpeg with **libass**. Homebrew's slim `ffmpeg` formula
+ships *without* libass, so the burn pass uses the keg-only `ffmpeg-full`:
+
+```bash
+brew install ffmpeg-full   # libass-enabled; keg-only, so it won't shadow your system ffmpeg
+```
+
+The clipper auto-detects it at `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg`
+(override with `CLIPPER_FFMPEG_FULL_BIN`). If no libass build is found it warns
+and falls back to clean clips + sidecar `.srt` — captions just won't be burned.
+
 ## Usage
 
 ```bash
@@ -106,6 +133,8 @@ yarn clip <slug> --manifest CID  # skip the chain, use a manifest CID directly
 yarn clip <slug> --limit 12      # only render the top N clips
 yarn clip <slug> --target 25     # target clip length in seconds (10–40)
 yarn clip <slug> --no-judge      # skip the adversarial judge re-rank
+yarn clip <slug> --no-refine     # skip context-aware caption correction (raw STT)
+yarn clip <slug> --no-burn       # don't burn captions in (clean video + sidecar .srt)
 yarn clip <slug> --force         # ignore caches (re-download, re-transcribe, re-judge)
 ```
 
@@ -117,9 +146,11 @@ out/binji-x/
   transcript.json     # word + segment timestamps (cached)
   candidates.json     # raw LLM clip picks (cached)
   judge.json          # adversarial verdicts, keyed by clip content (cached)
+  captions.json       # context-corrected caption tokens, keyed by clip content (cached)
   clips/
-    01_<title>.mp4    # ranked, highest blended score first
-    01_<title>.srt
+    01_<title>.mp4    # ranked, highest blended score first — captions burned in
+    01_<title>.srt    # corrected, clip-relative
+    01_<title>.ass    # the karaoke style burned into the mp4 (re-burn / re-style here)
     02_<title>.mp4
     …
   index.json          # ranked clip metadata (pick + judge scores, critiques)
@@ -133,12 +164,21 @@ out/binji-x/
   `--force` re-does them.
 - **Clip bounds** live at the top of `src/clips.ts` (`MIN`/`MAX`/`LEAD`/`TAIL`,
   overlap threshold).
+- **Caption look** (font, size via `CLIPPER_CAPTION_SCALE`, the purple / white /
+  pink colours, and the translucent background band that lifts captions off busy
+  footage) is configurable via env (`CLIPPER_CAPTION_*`, see `src/config.ts`);
+  ASS line-grouping knobs live at the top of `src/ass.ts`.
+- **Caption vocabulary.** The glossary at the top of `src/refine.ts` is the place
+  to teach the corrector new proper nouns / jargon (it already knows `Clawd` vs
+  `Claude Code` vs `Claude`). Correction never invents timing — it only remaps
+  spelling onto the real spoken words — so adding terms is safe.
 - **Models** are configurable via env (`CLIPPER_ANTHROPIC_MODEL`,
-  `CLIPPER_TRANSCRIBE_MODEL`, …); defaults match slop's own stack.
+  `CLIPPER_REFINE_MODEL`, `CLIPPER_TRANSCRIBE_MODEL`, …); defaults match slop's
+  own stack.
 
 ## Roadmap
 
-- Burned-in captions and a 9:16 social reframe (v1 ships clean landscape + sidecar `.srt`).
+- A 9:16 social reframe (v1 burns captions onto the clean landscape cut).
 - Fold clips into the slop deploy so they render at the bottom of the slug page.
 
 License: MIT.

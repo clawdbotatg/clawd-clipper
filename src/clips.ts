@@ -1,9 +1,13 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { findSpan } from "./anchor.js";
+import { buildAss } from "./ass.js";
 import type { RawCandidate } from "./candidates.js";
-import { cutClip } from "./ffmpeg.js";
+import { cutClip, cutClipVertical, libassBin, probeSize } from "./ffmpeg.js";
+import { clipKey } from "./judge.js";
+import { rawTokens, windowWords, type CaptionToken, type Captions } from "./refine.js";
 import type { Segment, Transcript, Word } from "./transcribe.js";
+import type { ClipLayout } from "./vertical.js";
 
 // Bounds + padding for a finished clip.
 const MIN = 10;
@@ -32,12 +36,17 @@ export type ResolvedClip = {
   critique?: string; // the judge's single biggest knock against the clip
   verdict?: "keep" | "cut";
   finalScore?: number; // blend of score + judgeScore used for the final rank
+  captionText?: string; // context-corrected caption text (refine.ts), if it ran
+  // Filled in by speaker attribution (speakers.ts), if a live transcript aligned:
+  speaker?: string; // dominant speaker in the clip (handle/ENS, else short addr)
+  speakers?: { speaker: string; chars: number; pct: number }[]; // full share split
 };
 
 export type Clip = ResolvedClip & {
   rank: number;
   file: string; // mp4 filename (relative to clips dir)
   srt: string; // srt filename
+  mobileFile?: string; // 9:16 mobile mp4 (relative to clips dir), when --vertical
 };
 
 const slugify = (s: string) =>
@@ -224,18 +233,28 @@ function toSrtTime(sec: number): string {
   return `${p(h)}:${p(m)}:${p(s)},${p(f, 3)}`;
 }
 
-/** Build a clip-relative SRT from the words inside the window. */
-function buildSrt(words: Word[], start: number, end: number): string {
-  const inWin = words.filter(w => w.end > start && w.start < end);
-  // Group ~7 words per caption line for readability.
+// Tidy joined caption text: collapse spaces, pull punctuation onto the prior word.
+function joinTokens(tokens: CaptionToken[]): string {
+  return tokens
+    .map(t => t.text.trim())
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.!?;:%)\]}…])/g, "$1")
+    .replace(/([([{])\s+/g, "$1")
+    .trim();
+}
+
+/** Build a clip-relative SRT from caption tokens (carries the refined text). */
+function buildSrt(tokens: CaptionToken[], clipStart: number): string {
+  // Group ~7 tokens per caption line for readability.
   const lines: string[] = [];
   let idx = 1;
-  for (let i = 0; i < inWin.length; i += 7) {
-    const group = inWin.slice(i, i + 7);
+  for (let i = 0; i < tokens.length; i += 7) {
+    const group = tokens.slice(i, i + 7);
     if (!group.length) break;
-    const a = Math.max(0, group[0]!.start - start);
-    const b = Math.max(a + 0.3, group[group.length - 1]!.end - start);
-    lines.push(`${idx}\n${toSrtTime(a)} --> ${toSrtTime(b)}\n${joinWords(group)}\n`);
+    const a = Math.max(0, group[0]!.start - clipStart);
+    const b = Math.max(a + 0.3, group[group.length - 1]!.end - clipStart);
+    lines.push(`${idx}\n${toSrtTime(a)} --> ${toSrtTime(b)}\n${joinTokens(group)}\n`);
     idx++;
   }
   return lines.join("\n");
@@ -246,6 +265,10 @@ export async function buildClips(opts: {
   transcript: Transcript;
   resolved: ResolvedClip[];
   clipsDir: string;
+  captions?: Captions; // context-corrected tokens (refine.ts); falls back to raw STT per clip
+  burn?: boolean; // burn karaoke captions into the video
+  vertical?: boolean; // render 9:16 mobile clips (stacked speaker tiles)
+  layouts?: Record<string, ClipLayout>; // per-clip crop boxes (clipKey -> layout), for vertical
   limit?: number;
   log?: (m: string) => void;
 }): Promise<Clip[]> {
@@ -254,6 +277,22 @@ export async function buildClips(opts: {
   // filenames) don't linger as orphans.
   await rm(opts.clipsDir, { recursive: true, force: true });
   await mkdir(opts.clipsDir, { recursive: true });
+
+  // Burning styled captions needs a libass-capable ffmpeg + the video's pixel
+  // size (so the ASS scales right). If burn was asked for but no libass build
+  // is around, warn once and fall back to plain clips rather than failing.
+  const wantBurn = opts.burn ?? false;
+  const burnBin = wantBurn ? libassBin() : null;
+  if (wantBurn && !burnBin) {
+    log("burn-in requested but no libass ffmpeg found (set CLIPPER_FFMPEG_FULL_BIN) — writing plain clips");
+  }
+  // When --vertical is on we emit BOTH a 16:9 landscape clip and a 9:16 mobile
+  // clip per pick (the mobile one re-cut with stacked speaker tiles), so the
+  // gallery can toggle between them. The landscape ASS is sized to the source;
+  // the mobile ASS is a fixed 1080×1920.
+  const vertical = opts.vertical ?? false;
+  const size = burnBin ? await probeSize(opts.source) : null;
+
   // Final order = judge-blended score when the judge ran, else the
   // selection score. (resolveCandidates already de-overlapped on score.)
   const ranked = [...opts.resolved].sort((a, b) => (b.finalScore ?? b.score) - (a.finalScore ?? a.score));
@@ -265,10 +304,47 @@ export async function buildClips(opts: {
     const base = `${rank.toString().padStart(2, "0")}_${slugify(c.title)}`;
     const file = `${base}.mp4`;
     const srt = `${base}.srt`;
-    log(`clip ${rank}/${list.length} [${c.finalScore ?? c.score}] ${c.title} (${c.duration}s)`);
-    await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end);
-    await writeFile(join(opts.clipsDir, srt), buildSrt(opts.transcript.words, c.start, c.end));
-    clips.push({ rank, ...c, file, srt });
+    // Caption tokens: the corrected ones if refine ran for this clip, else raw STT.
+    const tokens = opts.captions?.[clipKey(c)] ?? rawTokens(windowWords(opts.transcript.words, c.start, c.end));
+
+    log(
+      `clip ${rank}/${list.length} [${c.finalScore ?? c.score}] ${c.title} (${c.duration}s${burnBin ? ", burning captions" : ""})`,
+    );
+
+    // Landscape (always): write the clip-relative ASS next to the mp4, then cut
+    // + burn in one pass (ffmpeg runs in clipsDir so the filter takes a bare
+    // basename). Without a libass build, fall back to a plain (un-captioned) cut.
+    if (burnBin && size) {
+      const assName = `${base}.ass`;
+      await writeFile(join(opts.clipsDir, assName), buildAss(tokens, c.start, size.width, size.height));
+      await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end, {
+        assFile: assName,
+        bin: burnBin,
+        cwd: opts.clipsDir,
+      });
+    } else {
+      await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end);
+    }
+
+    // Mobile (--vertical): a second cut into <base>.mobile.mp4 — speakers' tiles
+    // stacked into 1080×1920 (or blur-pad when boxes are null), captions centred
+    // on the seam.
+    let mobileFile: string | undefined;
+    if (vertical) {
+      mobileFile = `${base}.mobile.mp4`;
+      const boxes = opts.layouts?.[clipKey(c)]?.boxes ?? null;
+      const assName = `${base}.mobile.ass`;
+      if (burnBin) await writeFile(join(opts.clipsDir, assName), buildAss(tokens, c.start, 1080, 1920, { vertical: true }));
+      await cutClipVertical(opts.source, join(opts.clipsDir, mobileFile), c.start, c.end, {
+        boxes,
+        assFile: burnBin ? assName : undefined,
+        bin: burnBin ?? undefined,
+        cwd: opts.clipsDir,
+      });
+    }
+
+    await writeFile(join(opts.clipsDir, srt), buildSrt(tokens, c.start));
+    clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile });
   }
   return clips;
 }
