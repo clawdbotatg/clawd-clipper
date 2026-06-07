@@ -154,11 +154,18 @@ export async function extractFrame(source: string, atSec: number, dest: string):
 /** A pixel-space crop rectangle within the source frame (already inset/clamped). */
 export type CropBox = { x: number; y: number; w: number; h: number };
 
+/** A crop box plus the fraction of the 1920px tall frame it should occupy when
+ *  stacked, and how it fills its cell: `cover` (fill + crop overflow — for camera
+ *  faces) or `contain` (letterbox — for screen shares so demo content survives).
+ *  Weights are relative (normalised by the caller's sum). */
+export type StackTile = CropBox & { weight: number; fit: "cover" | "contain" };
+
 /**
  * Cut [startSec, endSec] into a 1080×1920 (9:16) mobile clip, then burn captions
- * (if `opts.assFile`). Composition depends on `opts.boxes`:
- *   - two boxes  → crop each speaker's tile, cover-fit to 1080×960, vstack them.
- *   - one box    → crop that tile, cover-fit to the full 1080×1920.
+ * (if `opts.assFile`). Composition depends on `opts.tiles`:
+ *   - N tiles    → crop each region and vstack them, each tile's height set by
+ *                  its `weight` (so a speaker cam can take 1/3 over a screen at
+ *                  2/3, or two cams split 50/50). cover-fit fills each cell.
  *   - none/null  → blur-pad: the whole frame fit on a blurred, zoomed copy of
  *                  itself (the layout-agnostic fallback when tiles can't be found).
  * cover-fit = scale up to fill, then centre-crop the overflow, so tiles fill
@@ -170,27 +177,39 @@ export async function cutClipVertical(
   dest: string,
   startSec: number,
   endSec: number,
-  opts: { boxes?: CropBox[] | null; assFile?: string; bin?: string; cwd?: string } = {},
+  opts: { tiles?: StackTile[] | null; assFile?: string; bin?: string; cwd?: string } = {},
 ): Promise<void> {
   const dur = Math.max(0.1, endSec - startSec);
   const W = 1080;
   const H = 1920;
-  const half = H / 2; // 960
-  const boxes = opts.boxes && opts.boxes.length ? opts.boxes : null;
-  // cover-fit helper: scale up to fill WxH (keeping aspect), then crop overflow.
+  const tiles = opts.tiles && opts.tiles.length ? opts.tiles : null;
+  // cover  = scale up to fill WxH (keep aspect), crop the overflow — no bars.
+  // contain = scale down to fit inside WxH (keep aspect), pad the gaps black.
   const cover = (w: number, h: number) =>
     `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1`;
+  const contain = (w: number, h: number) =>
+    `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+  const fit = (w: number, h: number, mode: "cover" | "contain") => (mode === "contain" ? contain(w, h) : cover(w, h));
 
   let chain: string;
-  if (boxes && boxes.length >= 2) {
-    const [a, b] = boxes as [CropBox, CropBox];
-    chain =
-      `[0:v]crop=${a.w}:${a.h}:${a.x}:${a.y},${cover(W, half)}[t0];` +
-      `[0:v]crop=${b.w}:${b.h}:${b.x}:${b.y},${cover(W, half)}[t1];` +
-      `[t0][t1]vstack=inputs=2[vs]`;
-  } else if (boxes && boxes.length === 1) {
-    const a = boxes[0]!;
-    chain = `[0:v]crop=${a.w}:${a.h}:${a.x}:${a.y},${cover(W, H)}[vs]`;
+  if (tiles) {
+    // Per-tile heights from weights, even (yuv420p) and summing to exactly H —
+    // the last tile absorbs the rounding remainder.
+    const total = tiles.reduce((s, t) => s + (t.weight > 0 ? t.weight : 0), 0) || tiles.length;
+    const heights: number[] = [];
+    let used = 0;
+    tiles.forEach((t, i) => {
+      const h = i === tiles.length - 1 ? H - used : Math.max(2, Math.round((H * t.weight) / total / 2) * 2);
+      heights.push(h);
+      used += h;
+    });
+    const parts = tiles.map((t, i) => `[0:v]crop=${t.w}:${t.h}:${t.x}:${t.y},${fit(W, heights[i]!, t.fit)}[t${i}]`);
+    if (tiles.length === 1) {
+      chain = `${parts[0]!.replace(/\[t0\]$/, "[vs]")}`;
+    } else {
+      const labels = tiles.map((_, i) => `[t${i}]`).join("");
+      chain = `${parts.join(";")};${labels}vstack=inputs=${tiles.length}[vs]`;
+    }
   } else {
     chain =
       `[0:v]split=2[bg][fg];` +

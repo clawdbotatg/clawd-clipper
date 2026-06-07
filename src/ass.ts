@@ -65,18 +65,20 @@ function groupLines(tokens: CaptionToken[], maxChars: number): CaptionToken[][] 
  * `clipStart` shifts them to the clip-relative timeline the burned video uses.
  *
  * `opts.vertical` switches to the 9:16 mobile layout: a tall, narrow (1080-wide)
- * frame where the captions sit CENTRED over the seam between the two stacked
- * speaker tiles, rather than along the bottom. Text is sized off the (smaller)
- * width and lines wrap shorter so they stay inside the narrow frame.
+ * frame where the captions sit over the SEAM between stacked tiles, rather than
+ * along the bottom. `opts.seamFrac` (0..1 of height) is where that seam is — it
+ * moves with the layout (0.5 for an even two-up stack, ~0.34 for a speaker-over-
+ * screen interview, ~0.85 for a single full tile so the caption stays low). Text
+ * is sized off the (smaller) width and lines wrap shorter to fit the frame.
  */
 export function buildAss(
   tokens: CaptionToken[],
   clipStart: number,
   width: number,
   height: number,
-  opts: { vertical?: boolean } = {},
+  opts: { vertical?: boolean; seamFrac?: number; speakerSpans?: { speaker: string; start: number; end: number }[] } = {},
 ): string {
-  const { font, scale, box, boxColor, boxAlpha, base, active, outline, glow } = config.caption;
+  const { font, scale, marginV: marginVFrac, box, boxColor, boxAlpha, base, active, outline, glow } = config.caption;
   const vertical = opts.vertical ?? false;
   // Landscape sizes off height; vertical sizes off the (limiting) width so big
   // text still fits the 1080-wide frame.
@@ -86,7 +88,7 @@ export function buildAss(
   const align = vertical ? 5 : 2;
   const outlineW = Math.max(2, Math.round(fontSize * 0.12));
   const shadow = Math.max(1, Math.round(fontSize * 0.05));
-  const marginV = Math.round(height * 0.08);
+  const marginV = Math.round(height * marginVFrac);
   const marginH = Math.round(width * 0.06);
   // Menlo is monospace: every glyph advances the same width (~0.6em), so a
   // line's pixel width — and thus the background band — is computable exactly.
@@ -127,12 +129,16 @@ export function buildAss(
   const cx = Math.round(width / 2);
   const bandH = Math.round(fontSize * 1.5);
   const padX = Math.round(fontSize * 0.45);
-  // Vertical: the band is centred on the frame's middle (the seam), matching the
-  // middle-centre text alignment. Landscape: its bottom edge sits at the text
-  // baseline (style MarginV), nudged down so descenders stay inside the band.
+  // Vertical: captions sit on the layout's seam (seamFrac of height), so they
+  // land between tiles instead of over a face. Landscape: the band's bottom edge
+  // sits at the text baseline (style MarginV), nudged down for descenders.
+  const seamY = Math.round(height * (opts.seamFrac ?? 0.5));
   const bandTopY = vertical
-    ? Math.round(height / 2 - bandH / 2)
+    ? seamY - Math.round(bandH / 2)
     : height - marginV + Math.round(fontSize * 0.28) - bandH;
+  // Vertical text is anchored explicitly to the seam (middle-centre via \\pos),
+  // overriding the style's centred placement so it tracks seamY exactly.
+  const posPrefix = vertical ? `{\\an5\\pos(${cx},${seamY})}` : "";
 
   function bandEvent(line: CaptionToken[], from: number, to: number): string {
     const chars = line.reduce((n, tk) => n + tk.text.length, 0) + (line.length - 1); // glyphs + inter-word spaces
@@ -177,7 +183,23 @@ export function buildAss(
       const segStart = starts[i]!;
       const segEnd = i + 1 < n ? starts[i + 1]! : lineEnd;
       const text = line.map((tk, j) => `${j === i ? liveTag : restTag}${esc(tk.text)}`).join(" ");
-      events.push(`Dialogue: 1,${assTime(segStart)},${assTime(segEnd)},Slop,,0,0,0,,${text}`);
+      events.push(`Dialogue: 1,${assTime(segStart)},${assTime(segEnd)},Slop,,0,0,0,,${posPrefix}${text}`);
+    }
+  }
+
+  // Speaker nameplate: a small label pinned near the top that tracks WHO is
+  // talking, switching as the dominant speaker changes (clip-relative spans from
+  // speakers.ts). Layer 2 so it always sits above the captions, and parked high
+  // so it never collides with the bottom (landscape) or seam (vertical) text.
+  const spans = opts.speakerSpans ?? [];
+  if (spans.length) {
+    const nameSize = Math.max(18, Math.round(fontSize * 0.6));
+    const nameY = Math.round(height * (vertical ? 0.05 : 0.07));
+    const nbord = Math.max(2, Math.round(nameSize * 0.14));
+    for (const sp of spans) {
+      // White + bold on a dark outline so the handle reads over a busy frame.
+      const tags = `\\an8\\pos(${cx},${nameY})\\fs${nameSize}\\b1\\c${active}\\3c${outline}\\bord${nbord}\\shad${shadow}`;
+      events.push(`Dialogue: 2,${assTime(sp.start)},${assTime(sp.end)},Slop,,0,0,0,,{${tags}}${esc(sp.speaker)}`);
     }
   }
 

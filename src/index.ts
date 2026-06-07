@@ -6,11 +6,19 @@ import { downloadFile } from "./download.js";
 import { writeGallery } from "./gallery.js";
 import { applyVerdicts, clipKey, getVerdicts, type JudgeVerdict } from "./judge.js";
 import { refineCaptions, type Captions } from "./refine.js";
+import { applyTweets, generateTweets, type Tweets } from "./tweets.js";
 import { resolveBySlug, resolveByManifestCid, type ResolvedEpisode } from "./resolve.js";
 import { transcribeVideo } from "./transcribe.js";
 import { probeSize } from "./ffmpeg.js";
-import { alignToVideo, attributeWindow, fetchLiveTranscript, namesFromParticipants, type LiveLine } from "./speakers.js";
-import { resolveClipLayout, type ClipLayout } from "./vertical.js";
+import {
+  alignToVideo,
+  attributeWindow,
+  fetchLiveTranscript,
+  namesFromParticipants,
+  speakerSpans,
+  type LiveLine,
+} from "./speakers.js";
+import { composeLayout, detectClipWindows, type ClipLayout, type DetectedWindow } from "./vertical.js";
 
 // CLI: clip an episode end-to-end.
 //
@@ -21,6 +29,7 @@ import { resolveClipLayout, type ClipLayout } from "./vertical.js";
 //   yarn clip <slug> --no-judge      skip the adversarial judge re-rank
 //   yarn clip <slug> --no-refine     skip context-aware caption correction (raw STT)
 //   yarn clip <slug> --no-burn       don't burn karaoke captions into the video
+//   yarn clip <slug> --no-tweets     skip generating suggested post copy per clip
 //   yarn clip <slug> --vertical      render 9:16 mobile clips (stacked speaker tiles)
 //   yarn clip <slug> --force         ignore caches (re-download, re-transcribe)
 
@@ -32,19 +41,21 @@ type Args = {
   judge: boolean;
   refine: boolean;
   burn: boolean;
+  tweets: boolean;
   vertical: boolean;
   force: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, vertical: false };
+  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
     else if (a === "--no-judge") out.judge = false;
     else if (a === "--no-refine") out.refine = false;
     else if (a === "--no-burn") out.burn = false;
+    else if (a === "--no-tweets") out.tweets = false;
     else if (a === "--vertical") out.vertical = true;
     else if (a === "--manifest") out.manifest = argv[++i];
     else if (a === "--limit") out.limit = Number(argv[++i]);
@@ -54,7 +65,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (!positional[0])
     throw new Error(
-      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--vertical] [--force]",
+      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--force]",
     );
   return {
     slug: positional[0],
@@ -62,6 +73,7 @@ function parseArgs(argv: string[]): Args {
     judge: out.judge ?? true,
     refine: out.refine ?? true,
     burn: out.burn ?? true,
+    tweets: out.tweets ?? true,
     vertical: out.vertical ?? false,
     force: out.force ?? false,
   };
@@ -163,6 +175,8 @@ async function main() {
         if (info.primary) {
           c.speaker = info.primary;
           c.speakers = info.shares;
+          // Time-resolved spans so the burned nameplate tracks who's talking.
+          c.speakerSpans = speakerSpans(live, align.offsetMs, c.start, c.end);
         }
       }
       const who = [...new Set(resolvedCands.map(c => c.speaker).filter(Boolean))].join(", ");
@@ -195,63 +209,73 @@ async function main() {
     }
   }
 
-  // 9:16 mobile composition: detect each clip's speaker tiles so we can stack
-  // them. One vision call per clip (sampled frame) — so cache the result
-  // (layout.json) keyed by clip content, like judge verdicts / captions.
-  let layouts: Record<string, ClipLayout> = {};
-  if (args.vertical && resolvedCands.length) {
-    log(`\n▸ detecting speaker tiles (9:16 mobile)…`);
-    const layoutPath = join(outDir, "layout.json");
+  // Suggested post copy (short + long tweet) per clip, ready to ship with the
+  // video. Uses the corrected caption text + the judge's critique (so the copy
+  // supplies the hook the clip lacks cold). Cached (tweets.json) by clip content.
+  if (args.tweets && resolvedCands.length) {
+    log(`\n▸ drafting post copy…`);
+    const tweetPath = join(outDir, "tweets.json");
+    let tweets: Tweets = {};
     if (!args.force) {
       try {
-        layouts = JSON.parse(await readFile(layoutPath, "utf8")) as Record<string, ClipLayout>;
+        tweets = JSON.parse(await readFile(tweetPath, "utf8")) as Tweets;
       } catch {
         /* no cache */
       }
     }
-    const allCovered = resolvedCands.every(c => layouts[clipKey(c)]);
-    if (allCovered && Object.keys(layouts).length) {
-      log(`  loaded cached layouts`);
+    const allCovered = resolvedCands.every(c => tweets[clipKey(c)]);
+    if (allCovered && Object.keys(tweets).length) {
+      log(`  loaded cached copy`);
     } else {
-      const size = await probeSize(source);
+      tweets = await generateTweets(resolvedCands, captions, ep.manifest.meta, m => log(`  ${m}`));
+      await writeFile(tweetPath, JSON.stringify(tweets, null, 2));
+    }
+    resolvedCands = applyTweets(resolvedCands, tweets);
+  }
+
+  // 9:16 mobile composition. The recording is a desktop of titled windows
+  // ("CAMERA — <name>", "SCREEN — <name>", apps); one vision call per clip reads
+  // those title bars into window boxes (cached in windows.json — detection is the
+  // expensive part). The layout is then COMPOSED from the cached windows + the
+  // clip's attributed speakers on every run (a pure function — free to retune).
+  let layouts: Record<string, ClipLayout> = {};
+  if (args.vertical && resolvedCands.length) {
+    log(`\n▸ detecting windows (9:16 mobile)…`);
+    const windowsPath = join(outDir, "windows.json");
+    let windows: Record<string, DetectedWindow[]> = {};
+    if (!args.force) {
+      try {
+        windows = JSON.parse(await readFile(windowsPath, "utf8")) as Record<string, DetectedWindow[]>;
+      } catch {
+        /* no cache */
+      }
+    }
+    const size = await probeSize(source);
+    const missing = resolvedCands.filter(c => !windows[clipKey(c)]);
+    if (!missing.length) {
+      log(`  loaded cached windows`);
+    } else {
       const framesDir = join(outDir, "frames");
       await mkdir(framesDir, { recursive: true });
-
-      // Recover WHO is talking when, so we can match speakers to detected tiles.
-      // (No live transcript, or no alignment → blur-pad fallback for every clip.)
-      let live: LiveLine[] = [];
-      let offsetMs: number | null = null;
-      const tcid = ep.manifest.transcript?.cid;
-      if (tcid) {
-        const names = namesFromParticipants(ep.manifest.participants);
-        live = await fetchLiveTranscript(tcid, names);
-        const align = alignToVideo(live, transcript);
-        offsetMs = align.offsetMs;
-        log(
-          offsetMs == null
-            ? `  could not align live transcript — falling back to blur-pad`
-            : `  aligned live transcript: offset ${(offsetMs / 1000).toFixed(1)}s · ${align.matches} matches`,
-        );
-      } else {
-        log(`  manifest has no live transcript — falling back to blur-pad`);
-      }
-
-      layouts = {};
-      for (const c of resolvedCands) {
+      for (const c of missing) {
         const key = clipKey(c);
-        layouts[key] = await resolveClipLayout({
+        windows[key] = await detectClipWindows({
           source,
-          srcW: size.width,
-          srcH: size.height,
           framePath: join(framesDir, `${key}.png`),
           startSec: c.start,
           endSec: c.end,
-          live,
-          offsetMs,
           log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
         });
       }
-      await writeFile(layoutPath, JSON.stringify(layouts, null, 2));
+      await writeFile(windowsPath, JSON.stringify(windows, null, 2));
+    }
+    // Compose each clip's layout from its windows + attributed speakers.
+    for (const c of resolvedCands) {
+      const key = clipKey(c);
+      const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
+      const layout = composeLayout(windows[key] ?? [], speakers, size.width, size.height);
+      layouts[key] = layout;
+      log(`  ${c.title.slice(0, 36)} — ${layout.kind}${layout.speakers.length ? ` (${layout.speakers.join(" / ")})` : ""}`);
     }
   }
 

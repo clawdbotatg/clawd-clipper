@@ -36,6 +36,9 @@ export const config = {
   // the selection model rather than a cheaper one.
   refineModel: env("CLIPPER_REFINE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
 
+  // Per-clip tweet/post copy (tweets.ts). Defaults to the selection model.
+  tweetsModel: env("CLIPPER_TWEETS_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+
   // ffmpeg binaries. The everyday ops (probe / audio extract / plain cut) use
   // the system `ffmpeg`. Burning styled captions needs libass, which the slim
   // homebrew `ffmpeg` lacks — so the burn pass uses the keg-only `ffmpeg-full`
@@ -50,6 +53,7 @@ export const config = {
   caption: {
     font: env("CLIPPER_CAPTION_FONT") || "Menlo", // monospace, fits slop's code aesthetic; has a Bold face
     scale: Number(env("CLIPPER_CAPTION_SCALE")) || 0.085, // font height as a fraction of video height
+    marginV: Number(env("CLIPPER_CAPTION_MARGIN")) || 0.13, // caption baseline height above the bottom, as a fraction of height
     box: env("CLIPPER_CAPTION_BOX") !== "0", // draw a translucent band behind the line (off: CLIPPER_CAPTION_BOX=0)
     boxColor: env("CLIPPER_CAPTION_BOX_COLOR") || "&H1A0A1F", // band fill — dark plum (&HBBGGRR)
     boxAlpha: env("CLIPPER_CAPTION_BOX_ALPHA") || "&H55", // band transparency (&H00 opaque … &HFF clear)

@@ -125,3 +125,44 @@ export function attributeWindow(
     .sort((a, b) => b.chars - a.chars);
   return { primary: shares[0]!.speaker, shares };
 }
+
+/** A stretch of clip-relative time (seconds from the clip's start) owned by one
+ *  speaker — what the burned-in nameplate tracks. */
+export type SpeakerSpan = { speaker: string; start: number; end: number };
+
+/**
+ * Who is talking *when* inside [startSec, endSec], as clip-relative spans so the
+ * burned nameplate can switch as the speaker changes. Each live line's `ts` is
+ * the relay's receive time (~end of utterance), so a line owns the gap from the
+ * previous line up to its own ts; the first line gets a short assumed lead.
+ * Consecutive same-speaker spans (and tiny gaps between them) are merged, and
+ * slivers shorter than `minSpan` are dropped so the label doesn't flicker.
+ */
+export function speakerSpans(
+  live: LiveLine[],
+  offsetMs: number,
+  startSec: number,
+  endSec: number,
+  opts: { leadSec?: number; minSpan?: number } = {},
+): SpeakerSpan[] {
+  const leadSec = opts.leadSec ?? 3;
+  const minSpan = opts.minSpan ?? 0.5;
+  const pts = live.map(l => ({ t: (l.ts - offsetMs) / 1000, speaker: l.speaker })).sort((a, b) => a.t - b.t);
+
+  const abs: { speaker: string; s: number; e: number }[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const e = pts[i]!.t;
+    const s = i > 0 ? pts[i - 1]!.t : e - leadSec;
+    if (e <= startSec || s >= endSec) continue; // no overlap with the clip window
+    abs.push({ speaker: pts[i]!.speaker, s: Math.max(s, startSec), e: Math.min(e, endSec) });
+  }
+  const merged: { speaker: string; s: number; e: number }[] = [];
+  for (const r of abs) {
+    const last = merged[merged.length - 1];
+    if (last && last.speaker === r.speaker && r.s - last.e < 0.6) last.e = r.e;
+    else merged.push({ ...r });
+  }
+  return merged
+    .filter(m => m.e - m.s >= minSpan)
+    .map(m => ({ speaker: m.speaker, start: m.s - startSec, end: m.e - startSec }));
+}

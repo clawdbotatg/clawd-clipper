@@ -90,10 +90,15 @@ The pipeline, stage by stage (`src/`):
    white — which libass burns into the clip in 6. Skip with `--no-refine`
    (raw STT) or `--no-burn` (sidecar `.srt` only, clean video). The glossary at
    the top of `refine.ts` is where you teach the system new vocabulary.
-9. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
+9. **`tweets.ts`** — suggested **post copy** for each clip: a short scroll-stopper
+   and a longer version, ready to ship with the video. One batched call that sees
+   the corrected words, the speaker, and the judge's critique — so the copy
+   deliberately supplies the hook the critique says the clip lacks cold. Cached to
+   `tweets.json`, skip with `--no-tweets`.
+10. **`gallery.ts`** — `index.json` (machine-readable, ranked) and a
    zero-dependency `index.html` that plays every clip inline, best first, with
-   the pick/judge scores, the judge's critique, and the corrected caption text
-   on each card.
+   the pick/judge scores, the judge's critique, the corrected caption text, and
+   the short/long post copy (each with a one-click copy button) on each card.
 
 ## Setup
 
@@ -135,6 +140,7 @@ yarn clip <slug> --target 25     # target clip length in seconds (10–40)
 yarn clip <slug> --no-judge      # skip the adversarial judge re-rank
 yarn clip <slug> --no-refine     # skip context-aware caption correction (raw STT)
 yarn clip <slug> --no-burn       # don't burn captions in (clean video + sidecar .srt)
+yarn clip <slug> --no-tweets     # skip generating per-clip post copy
 yarn clip <slug> --force         # ignore caches (re-download, re-transcribe, re-judge)
 ```
 
@@ -147,6 +153,7 @@ out/binji-x/
   candidates.json     # raw LLM clip picks (cached)
   judge.json          # adversarial verdicts, keyed by clip content (cached)
   captions.json       # context-corrected caption tokens, keyed by clip content (cached)
+  tweets.json         # per-clip short/long post copy, keyed by clip content (cached)
   clips/
     01_<title>.mp4    # ranked, highest blended score first — captions burned in
     01_<title>.srt    # corrected, clip-relative

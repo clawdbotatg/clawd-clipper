@@ -76,6 +76,19 @@ export async function writeGallery(opts: {
         }
         <p class="reason">${esc(c.reason)}</p>
         ${c.critique ? `<p class="critique">⚖︎ ${esc(c.critique)}</p>` : ""}
+        ${
+          c.tweetShort || c.tweetLong
+            ? `<div class="tweets">${
+                c.tweetShort
+                  ? `<div class="tw"><div class="tw-h"><span>short</span><button class="copy" data-copy="${esc(c.tweetShort)}">copy</button></div><p class="tw-t">${esc(c.tweetShort)}</p></div>`
+                  : ""
+              }${
+                c.tweetLong
+                  ? `<div class="tw"><div class="tw-h"><span>long</span><button class="copy" data-copy="${esc(c.tweetLong)}">copy</button></div><p class="tw-t">${esc(c.tweetLong)}</p></div>`
+                  : ""
+              }</div>`
+            : ""
+        }
         <p class="tags">${c.kind ? `<b>${esc(c.kind)}</b> · ` : ""}${c.tags.map(esc).join(" · ")}</p>
         <p class="time">${mmss(c.start)}–${mmss(c.end)} · ${c.duration}s · <a href="${hUrl}"${swap} download>download</a> · <a href="clips/${esc(c.srt)}?v=${v}">srt</a></p>
         ${
@@ -129,6 +142,12 @@ export async function writeGallery(opts: {
   summary { cursor: pointer; color: #8a8a93; font-size: 12px; }
   .text { color: #b0b0b8; font-size: 12px; white-space: pre-wrap; }
   .text.caps { color: #e0a8ec; }
+  .tweets { margin: 8px 0 2px; display: grid; gap: 6px; }
+  .tw { background: #1d1320; border: 1px solid #3a2740; border-radius: 8px; padding: 7px 9px; }
+  .tw-h { display: flex; justify-content: space-between; align-items: center; color: #c98fe0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; }
+  .tw-t { margin: 0; color: #ecddf2; font-size: 12.5px; line-height: 1.45; }
+  .copy { cursor: pointer; background: #3a2740; color: #f0d8fa; border: 0; border-radius: 5px; padding: 2px 9px; font: inherit; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+  .copy:hover { background: #4d3357; }
 </style>
 </head>
 <body>
@@ -161,6 +180,20 @@ ${
 </script>`
     : ""
 }
+<script>
+(function () {
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = b.getAttribute("data-copy") || "";
+      navigator.clipboard.writeText(text).then(function () {
+        var prev = b.textContent;
+        b.textContent = "copied!";
+        setTimeout(function () { b.textContent = prev; }, 1200);
+      });
+    });
+  });
+})();
+</script>
 </body>
 </html>`;
   await writeFile(join(opts.outDir, "index.html"), html);

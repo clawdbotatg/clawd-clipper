@@ -37,9 +37,13 @@ export type ResolvedClip = {
   verdict?: "keep" | "cut";
   finalScore?: number; // blend of score + judgeScore used for the final rank
   captionText?: string; // context-corrected caption text (refine.ts), if it ran
+  // Filled in by the tweet pass (tweets.ts), if it ran — suggested post copy:
+  tweetShort?: string; // one-line scroll-stopper
+  tweetLong?: string; // 2-4 sentence version
   // Filled in by speaker attribution (speakers.ts), if a live transcript aligned:
   speaker?: string; // dominant speaker in the clip (handle/ENS, else short addr)
   speakers?: { speaker: string; chars: number; pct: number }[]; // full share split
+  speakerSpans?: { speaker: string; start: number; end: number }[]; // clip-relative, for the burned nameplate
 };
 
 export type Clip = ResolvedClip & {
@@ -316,7 +320,10 @@ export async function buildClips(opts: {
     // basename). Without a libass build, fall back to a plain (un-captioned) cut.
     if (burnBin && size) {
       const assName = `${base}.ass`;
-      await writeFile(join(opts.clipsDir, assName), buildAss(tokens, c.start, size.width, size.height));
+      await writeFile(
+        join(opts.clipsDir, assName),
+        buildAss(tokens, c.start, size.width, size.height, { speakerSpans: c.speakerSpans }),
+      );
       await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end, {
         assFile: assName,
         bin: burnBin,
@@ -326,17 +333,25 @@ export async function buildClips(opts: {
       await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end);
     }
 
-    // Mobile (--vertical): a second cut into <base>.mobile.mp4 — speakers' tiles
-    // stacked into 1080×1920 (or blur-pad when boxes are null), captions centred
-    // on the seam.
+    // Mobile (--vertical): a second cut into <base>.mobile.mp4 — the clip's
+    // detected windows stacked into 1080×1920 (or blur-pad when tiles are null),
+    // with captions burned on the layout's seam.
     let mobileFile: string | undefined;
     if (vertical) {
       mobileFile = `${base}.mobile.mp4`;
-      const boxes = opts.layouts?.[clipKey(c)]?.boxes ?? null;
+      const layout = opts.layouts?.[clipKey(c)];
       const assName = `${base}.mobile.ass`;
-      if (burnBin) await writeFile(join(opts.clipsDir, assName), buildAss(tokens, c.start, 1080, 1920, { vertical: true }));
+      if (burnBin)
+        await writeFile(
+          join(opts.clipsDir, assName),
+          buildAss(tokens, c.start, 1080, 1920, {
+            vertical: true,
+            seamFrac: layout?.seamFrac,
+            speakerSpans: c.speakerSpans,
+          }),
+        );
       await cutClipVertical(opts.source, join(opts.clipsDir, mobileFile), c.start, c.end, {
-        boxes,
+        tiles: layout?.tiles ?? null,
         assFile: burnBin ? assName : undefined,
         bin: burnBin ?? undefined,
         cwd: opts.clipsDir,
