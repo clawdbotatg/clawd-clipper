@@ -1,5 +1,13 @@
 # Window Geometry Log — cross-repo spec
 
+> **Status (2026-06-07):** relay logging + finalize/manifest pin **built &
+> typechecking** in `slop-computer-live`; manifest field **carried through** in
+> `slop-computer-frontpage` and `clawd-clipper` types. **Remaining:** the
+> clipper *consumption* path (fetch → replay → feed `composeLayout`, CV
+> fallback). See "Status & what's left" at the bottom. This doc is updated to
+> describe what was actually built, which is simpler than the first draft.
+
+
 **Goal:** publish the exact on-screen geometry of every desktop window over the
 course of an episode, so downstream tools (the clipper's 9:16 mobile crop) can
 read window rects **deterministically** instead of recovering them with computer
@@ -22,120 +30,167 @@ back to that. We ship **both**; the log is preferred when present.
 
 ---
 
-## Data format — `geometry.jsonl`
+## Data format — `geometry.jsonl` (as built)
 
-Append-only, newline-delimited JSON, time-ordered. First line is a header; the
-rest are slot deltas. Reconstruct the live window set at any time `T` by
-replaying events with `ts <= T` (last write per `id` wins; `removed` drops it).
+Append-only, newline-delimited JSON, time-ordered. During the session the relay
+appends only **event** lines; a **header** line is prepended at finalize (it
+carries `videoStartMs`, which is only known once the recording filename is
+parsed). Reconstruct the live window set at any time `T` by replaying events
+with `ts <= T`: keep the last geometry seen per `id`, treat `shown` as
+"visible", `removed` as "gone".
 
 ```jsonc
-// header (first line) — viewport is the coord space of the rects below; the
-// recorded frame may be a scaled/cropped capture of it (see "Coordinate space").
-{ "v": 1, "kind": "header", "viewport": { "width": 1920, "height": 1080 }, "videoStartMs": 1736900000000 }
+// header (prepended at finalize) — videoStartMs lets the consumer map a
+// wall-clock ts to video seconds. Server-side we do NOT know the OBS capture
+// viewport, so it is intentionally omitted (see "Coordinate space").
+{ "v": 1, "kind": "header", "videoStartMs": 1736900000000 }
 
-// a window moved/resized/appeared (one per change, throttled — see below)
-{ "ts": 1736900012345, "id": "owner-0xab12…-camera", "owner": "0xab12…", "handle": "binji",
-  "slotKind": "camera", "x": 520, "y": 88, "w": 480, "h": 360, "z": 6 }
+// a window appeared (a publication went live and mapped to this slot). Carries
+// the current geometry if a slot position was already remembered.
+{ "ts": 1736900010000, "id": "owner-0xab12…-camera", "shown": true,
+  "x": 520, "y": 88, "w": 480, "h": 360, "z": 6 }
 
-// a window closed / unpublished
+// a window moved/resized (throttled — coalesced to ≤1 line/slot/150ms)
+{ "ts": 1736900012345, "id": "owner-0xab12…-camera", "x": 540, "y": 90, "w": 480, "h": 360, "z": 7 }
+
+// a window closed (unpublished, or its peer disconnected)
 { "ts": 1736900098765, "id": "owner-0xab12…-camera", "removed": true }
 ```
 
-- `slotKind`: `"camera" | "screen" | "audio"` (matches `desktop.ts` `SlotKind`).
-- `handle`: resolved display name when known (lets the clipper map speaker → tile
-  with zero fuzzy matching). May be null for anon/unknown.
-- `videoStartMs`: filled in at finalize. Consumer maps `videoSec = (ts -
-  videoStartMs) / 1000` — the **same alignment** the relay already computes for
-  AI meta and the clipper already uses for speaker attribution.
+**Identity lives in the `id`, not in extra fields.** The slot id is
+`owner-<ownerKey>-<kind>` (or `owner-<ownerKey>-screen-<streamId>` for screen
+shares) — the exact `slotIdFor` convention shared with the frontend. So the
+consumer parses `ownerKey` + `kind` (`camera | screen | audio`) straight from
+the id and joins `ownerKey → handle` via `manifest.participants` (the clipper
+already loads this for speaker attribution; `ownerKey` is the lowercased wallet
+address for logged-in users). This keeps the relay decoupled — **no roster
+lookup, no handle/owner/kind duplicated into each line, no fragile parsing on
+the write side.** Only media slots (`owner-…` ids) are logged; browser/app
+windows aren't speakers and are skipped to keep the log tiny.
+
+- `videoStartMs`: stamped at finalize from the recording filename. Consumer maps
+  `videoSec = (ts - videoStartMs) / 1000` — the **same alignment** the relay
+  already computes for AI meta chapters and the clipper already uses for speaker
+  attribution.
 
 ---
 
-## Changes to `slop-computer-live`
+## Changes to `slop-computer-live` — **DONE**
 
 ### 1. Accumulate the log during the session
 
-Every geometry change funnels through **one chokepoint** already:
-`DesktopState.applySlotUpdate(patch)` in `packages/relay/src/desktop.ts`
-(invoked from the `slot_update` WS case in `packages/relay/src/index.ts`,
-~line 6176, which then `room.broadcast({ type: "slot", slot: merged })`).
+New file `packages/relay/src/geometry-log.ts` — a `GeometryLog` class with
+`recordMove(slot)` / `recordShow(id, slot)` / `recordHide(id)` / `readArchive()`,
+writing to `./.slop-data/rooms/<slug>/geometry.jsonl` (append-only via
+`appendFileSync`, mirroring `Transcript.persist`).
 
-Add a sibling **`GeometryLog`** (new file, e.g. `packages/relay/src/geometry-log.ts`)
-owned per-room, writing to `./.slop-data/rooms/<slug>/geometry.jsonl`:
+The key improvement over the first draft: **every geometry/visibility mutation
+is already a method on `DesktopState`**, so the log is owned by and wired
+*inside* `DesktopState` (`packages/relay/src/desktop.ts`), not scattered across
+WS handlers:
 
-- On every accepted `applySlotUpdate` → append a delta line for the merged slot
-  (resolve `owner`/`handle`/`slotKind` from the slot id + roster).
-- On window **close / unpublish** → append a `{ removed: true }` line.
-- **Throttle**: a drag fires many updates — coalesce to **≤1 line per slot per
-  ~150ms** (or emit only on drag-end), and reuse the existing atomic-write
-  debounce pattern from `DesktopState`'s slots persistence. Goal: a log that's
-  tiny next to chat/transcript.
-- Keep it **separate** from `slots.json` (that stays the current-state snapshot,
-  untouched). This is the time-series, append-only.
+- `applySlotUpdate()` → `recordMove(merged)` — covers **both** the `slot_update`
+  WS case *and* the HTTP `POST /v1/slots` route with zero call-site duplication.
+- `publish()` → `recordShow(slotIdFor(p), getSlot(slotId))` — window appeared.
+- `unpublish()` → `recordHide(slotIdFor(removed))` — window closed.
+- `clearPeerPublications()` → `recordHide` per ended publication — peer
+  disconnected (both the stale-peer sweep and the socket `close` path call this).
+
+`slotIdFor()` was added to `desktop.ts` (mirrors the frontend's `Desktop.tsx`).
+Throttle: `recordMove` coalesces to ≤1 line/slot/150ms with a trailing flush so
+the final resting position always lands. `slots.json` is untouched — this is a
+separate append-only time-series.
+
+`GeometryLog` is constructed in `room.ts` (`paths.geometry.path`) and passed to
+`new DesktopState(..., this.geometry)`; the room also keeps a `geometry`
+reference so finalize can snapshot it.
 
 ### 2. Pin it at finalize and reference it in the manifest
 
-In `packages/relay/src/recordings.ts`, mirror the transcript/chat path exactly:
+In `packages/relay/src/recordings.ts`, mirroring the transcript/chat path:
 
-- Add a `geometryArchive: { content: string; sampleCount: number } | null` field
-  to `finalizeRecording(opts)` (caller snapshots the room's `geometry.jsonl` and
-  passes it, like `transcriptArchive`).
-- Pin it with the existing `pinBlobToLocalIpfs(...)` helper (`filename:
-  "geometry.jsonl"`), emit a `{ phase: "pinning-geometry" }` event.
-- Stamp the header's `videoStartMs` from the value finalize already has.
-- Add to the manifest object built in `finalizeRecording`:
+- `finalizeRecording(opts)` gained `geometryArchive: { content; sampleCount } |
+  null`; the caller in `index.ts` passes `room.geometry.readArchive()`.
+- When `sampleCount > 0`: prepend the `{ v:1, kind:"header", videoStartMs }`
+  line (using the `videoStartMs` hoisted from the recording filename), pin via
+  the existing `pinBlobToLocalIpfs({ filename: "geometry.jsonl" })`, and emit
+  `{ phase: "pinning-geometry", sampleCount }`.
+- Manifest gains `geometry?: { cid; sampleCount; format }`, set with
+  `if (geometryPin) manifestJson.geometry = geometryPin;`.
 
-  ```ts
-  geometry?: { cid: string; sampleCount: number; format: "application/jsonl" };
-  // ...
-  if (geometryPin) manifestJson.geometry = geometryPin;
-  ```
-
-No change to the video, the on-chain reference, or any existing pin.
+No change to the video, the on-chain reference, or any existing pin. Relay
+package typechecks clean (`yarn check-types`).
 
 ---
 
-## Changes to `slop-computer-frontpage`
+## Changes to `slop-computer-frontpage` — **DONE**
 
-Purely additive — the frontpage just needs to **carry the field through** so
-consumers (the clipper) can read `manifest.geometry.cid`. Extend
-`EpisodeManifest` in `packages/nextjs/types/episode.ts`:
-
-```ts
-export type EpisodeManifest = {
-  // …existing fields…
-  /** Time-series of window geometry over the episode (geometry.jsonl on IPFS).
-   *  Lets tools read exact window rects instead of recovering them from pixels. */
-  geometry?: { cid: string; format?: string; sampleCount?: number };
-};
-```
-
-That's it for the frontend unless we later want to *use* it (e.g. an in-page
-"isolate this speaker" view). The key requirement: whatever code parses/re-emits
-the manifest must **not strip unknown fields** — keep `geometry` intact.
+Purely additive: added `geometry?: { cid: string; format?: string;
+sampleCount?: number }` to `EpisodeManifest` in
+`packages/nextjs/types/episode.ts`. Verified safe — the frontpage does **no
+schema validation and no field-by-field re-serialization** of the manifest
+(`fetchManifest` does `(await res.json()) as EpisodeManifest`, consumers use
+optional chaining), so unknown fields pass through untouched. `check-types`
+clean. The clipper has its own copy of the manifest type (`src/resolve.ts`) —
+the same field was added there too.
 
 ---
 
-## How the clipper consumes it (+ fallback)
+## How the clipper consumes it (+ fallback) — **REMAINING**
 
-In `clawd-clipper`, when resolving a clip's 9:16 layout:
+In `clawd-clipper`, when resolving a clip's 9:16 layout (the `missing`-windows
+loop in `src/index.ts:~254`, which today calls `detectClipWindows()` in
+`src/vertical.ts`):
 
-1. If `ep.manifest.geometry?.cid` exists → fetch `geometry.jsonl`, replay to the
-   clip's `videoSec` (via `videoStartMs`), and take the live windows' rects (+ z
-   for occlusion order, + `handle` for speaker→tile). **No vision.**
-2. Else → current deterministic pixel pipeline in `src/pixels.ts`.
+1. If `ep.manifest.geometry?.cid` exists → fetch `geometry.jsonl` (reuse
+   `gatewayUrl()` + `fetch`, as `fetchLiveTranscript` does), replay events to the
+   clip's `videoSec` window (via `videoStartMs` + the `offsetMs` already computed
+   for speaker attribution), take the visible windows' rects, parse `ownerKey`/
+   `kind` from each id, and join `ownerKey → handle` via `manifest.participants`.
+   **No vision.**
+2. Else → the deterministic pixel pipeline in `src/pixels.ts`
+   (`traceWindows() → WindowTrace[]`).
 
-Same downstream contract either way: per-window `{ left, top, right, bottom,
-handle, z }`.
+**Both paths must normalize to the existing `DetectedWindow[]` that
+`composeLayout()` already consumes** — that's the shared contract, not a new
+`{left,top,right,bottom}` shape. The geometry path is the richer source: it
+carries `z` (occlusion order), `kind`, and `ownerKey`/`handle` for free; the
+pixels.ts path supplies only the rect (`windowBox = {x,y,w,h}`) and leaves
+`z`/`handle`/`kind` null. Plan a small `src/geometry.ts` (fetch + replay →
+`DetectedWindow[]`) so `index.ts` just picks geometry-or-CV and feeds the same
+`composeLayout`.
 
 ---
 
-## Coordinate space (the one wrinkle)
+## Coordinate space (the one wrinkle — still unverified)
 
-The rects are in the **host browser's viewport** coords (`header.viewport`). OBS
-captures that browser, possibly scaled/cropped, into the recorded frame
-(typically 1920×1080). The consumer maps rects with a single affine transform:
-`scale = recordedFrame.height / viewport.height` (and an x/y offset if cropped).
-For a 1:1 capture this is identity. If it ever differs, one calibration constant
-per capture setup resolves it — and the visual-marker idea (a machine-readable
-code baked into each title bar, in capture pixels) remains the future option that
-sidesteps coordinate mapping entirely.
+Slot rects are in the **shared-desktop layout** coord space the frontend renders
+in; OBS captures that browser, possibly scaled/cropped, into the recorded frame
+(typically 1920×1080). The relay does **not** know the capture viewport, so the
+header omits it — the consumer maps rects with a single affine transform:
+`scale = recordedFrame.height / layout.height` (plus an x/y offset if cropped).
+For a 1:1 capture this is identity. **This is the one genuinely open risk:**
+nobody has confirmed the capture is 1:1, so the first integration test should
+overlay a replayed rect on a real frame and read off the calibration constant.
+The visual-marker idea (a machine-readable code baked into each title bar, in
+capture pixels) remains the future option that sidesteps coordinate mapping
+entirely.
+
+---
+
+## Status & what's left
+
+| Piece | Repo | Status |
+| --- | --- | --- |
+| `GeometryLog` + `DesktopState` wiring | slop-computer-live | ✅ built, typechecks |
+| finalize pin + `manifest.geometry` | slop-computer-live | ✅ built, typechecks |
+| `EpisodeManifest.geometry` carry-through | slop-computer-frontpage | ✅ done |
+| `EpisodeManifest.geometry` in clipper type | clawd-clipper | ✅ done |
+| Fetch + replay + `DetectedWindow[]` adapter | clawd-clipper | ⬜ remaining |
+| Wire geometry-or-CV switch into `index.ts` | clawd-clipper | ⬜ remaining |
+| Verify coordinate-space calibration on a real clip | — | ⬜ needs a recorded episode |
+
+The relay/manifest half is end-to-end ready: the next episode finalized on the
+new relay build will pin a `geometry.jsonl` and reference it from the manifest.
+The clipper consumption can then be built and tested against that real artifact
+(which also resolves the coordinate-space question).

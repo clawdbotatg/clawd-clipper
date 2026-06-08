@@ -52,6 +52,10 @@ export type EpisodeManifest = {
   video?: { cid: string; durationSeconds?: number; sizeBytes?: number; format?: string };
   transcript?: { cid: string; segmentCount?: number };
   chat?: { cid: string; messageCount?: number };
+  /** Window-geometry timeline (geometry.jsonl on IPFS). When present, the 9:16
+   *  vertical layout reads exact window rects from this instead of recovering
+   *  them from pixels — see src/geometry.ts / src/vertical.ts. */
+  geometry?: { cid: string; format?: string; sampleCount?: number };
   meta?: EpisodeMeta;
   participants?: { address: string | null; handle?: string | null; role?: string }[];
 };
