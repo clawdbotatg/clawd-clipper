@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { config } from "./config.js";
 
@@ -160,6 +160,17 @@ export type CropBox = { x: number; y: number; w: number; h: number };
  *  Weights are relative (normalised by the caller's sum). */
 export type StackTile = CropBox & { weight: number; fit: "cover" | "contain" };
 
+// Mobile (9:16) frame geometry, shared by the background renderer (desktop-bg.ts),
+// the layout's caption seam (vertical.ts) and the compositor below. The stacked
+// speaker tiles don't fill the frame: a slop.computer-style desktop shows through
+// as a TITLE BAR + top strip above the tiles and a desktop strip below, so the
+// output reads like the native mobileMode. Tiles occupy [videoTop, videoBottom].
+export const MOBILE_FRAME = { W: 1080, H: 1920, titleBarH: 104, videoTop: 240, videoBottom: 1680 } as const;
+export const mobileVideoAreaH = MOBILE_FRAME.videoBottom - MOBILE_FRAME.videoTop;
+/** Map a fraction WITHIN the video area (0=top tile edge, 1=bottom) to a fraction
+ *  of the full frame — used to place the caption seam over the composited stack. */
+export const mobileSeamFrac = (withinArea: number) => (MOBILE_FRAME.videoTop + withinArea * mobileVideoAreaH) / MOBILE_FRAME.H;
+
 /**
  * Cut [startSec, endSec] into a 1080×1920 (9:16) mobile clip, then burn captions
  * (if `opts.assFile`). Composition depends on `opts.tiles`:
@@ -177,12 +188,17 @@ export async function cutClipVertical(
   dest: string,
   startSec: number,
   endSec: number,
-  opts: { tiles?: StackTile[] | null; assFile?: string; bin?: string; cwd?: string } = {},
+  opts: { tiles?: StackTile[] | null; assFile?: string; bin?: string; cwd?: string; bgPath?: string } = {},
 ): Promise<void> {
   const dur = Math.max(0.1, endSec - startSec);
-  const W = 1080;
-  const H = 1920;
+  const W = MOBILE_FRAME.W;
+  const H = MOBILE_FRAME.H;
   const tiles = opts.tiles && opts.tiles.length ? opts.tiles : null;
+  // With a background image AND real tiles, the tiles fill only the VIDEO AREA
+  // (the desktop/title show as padding above + below); otherwise they fill the
+  // whole frame (back-compat, and the blur-pad fallback never uses the bg).
+  const useBg = !!opts.bgPath && !!tiles;
+  const areaH = useBg ? mobileVideoAreaH : H;
   // cover  = scale up to fill WxH (keep aspect), crop the overflow — no bars.
   // contain = scale down to fit inside WxH (keep aspect), pad the gaps black.
   const cover = (w: number, h: number) =>
@@ -191,25 +207,54 @@ export async function cutClipVertical(
     `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
   const fit = (w: number, h: number, mode: "cover" | "contain") => (mode === "contain" ? contain(w, h) : cover(w, h));
 
-  let chain: string;
-  if (tiles) {
-    // Per-tile heights from weights, even (yuv420p) and summing to exactly H —
-    // the last tile absorbs the rounding remainder.
-    const total = tiles.reduce((s, t) => s + (t.weight > 0 ? t.weight : 0), 0) || tiles.length;
+  // Build the tile-stack filter that crops each region and vstacks them into a
+  // W×(areaH) column. The seeked source CANNOT be an overlay input directly (its
+  // timestamps won't framesync against the looped background), so when there's a
+  // background we render this stack to a temp clip first (pass 1), then composite
+  // (pass 2). Without a background the stack fills the frame and is the output.
+  const stackChain = (): string => {
+    const total = tiles!.reduce((s, t) => s + (t.weight > 0 ? t.weight : 0), 0) || tiles!.length;
     const heights: number[] = [];
     let used = 0;
-    tiles.forEach((t, i) => {
-      const h = i === tiles.length - 1 ? H - used : Math.max(2, Math.round((H * t.weight) / total / 2) * 2);
+    tiles!.forEach((t, i) => {
+      const h = i === tiles!.length - 1 ? areaH - used : Math.max(2, Math.round((areaH * t.weight) / total / 2) * 2);
       heights.push(h);
       used += h;
     });
-    const parts = tiles.map((t, i) => `[0:v]crop=${t.w}:${t.h}:${t.x}:${t.y},${fit(W, heights[i]!, t.fit)}[t${i}]`);
-    if (tiles.length === 1) {
-      chain = `${parts[0]!.replace(/\[t0\]$/, "[vs]")}`;
-    } else {
-      const labels = tiles.map((_, i) => `[t${i}]`).join("");
-      chain = `${parts.join(";")};${labels}vstack=inputs=${tiles.length}[vs]`;
-    }
+    const parts = tiles!.map((t, i) => `[0:v]crop=${t.w}:${t.h}:${t.x}:${t.y},${fit(W, heights[i]!, t.fit)}[t${i}]`);
+    if (tiles!.length === 1) return `${parts[0]!.replace(/\[t0\]$/, "[vs]")}`;
+    const labels = tiles!.map((_, i) => `[t${i}]`).join("");
+    return `${parts.join(";")};${labels}vstack=inputs=${tiles!.length}[vs]`;
+  };
+
+  if (useBg) {
+    // PASS 1 — stack the tiles (with audio) into a clean W×areaH temp clip.
+    const tmp = `${dest}.stack.mp4`;
+    await runCut(
+      opts.bin ?? config.ffmpegBin,
+      ["-y", "-ss", startSec.toFixed(3), "-i", source, "-t", dur.toFixed(3), "-filter_complex", stackChain(),
+        "-map", "[vs]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k", "-loglevel", "error", tmp],
+      { cwd: opts.cwd },
+    );
+    // PASS 2 — composite the stack onto the looped desktop background (the desktop
+    // shows above + below), burn captions, carry the stack's audio.
+    let p2 = `[0:v][1:v]overlay=0:${MOBILE_FRAME.videoTop}:shortest=1[vs]`;
+    if (opts.assFile) p2 += `;[vs]ass=${opts.assFile}[v]`;
+    await runCut(
+      opts.bin ?? config.ffmpegBin,
+      ["-y", "-loop", "1", "-i", opts.bgPath!, "-i", tmp, "-filter_complex", p2, "-map", opts.assFile ? "[v]" : "[vs]",
+        "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        "-b:a", "160k", "-movflags", "+faststart", "-loglevel", "error", dest],
+      { cwd: opts.cwd },
+    );
+    await rm(tmp, { force: true });
+    return;
+  }
+
+  let chain: string;
+  if (tiles) {
+    chain = stackChain();
   } else {
     chain =
       `[0:v]split=2[bg][fg];` +

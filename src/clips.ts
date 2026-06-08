@@ -273,6 +273,7 @@ export async function buildClips(opts: {
   burn?: boolean; // burn karaoke captions into the video
   vertical?: boolean; // render 9:16 mobile clips (stacked speaker tiles)
   layouts?: Record<string, ClipLayout>; // per-clip crop boxes (clipKey -> layout), for vertical
+  mobileBg?: string; // slop-desktop background PNG composited behind the tiles (vertical)
   limit?: number;
   log?: (m: string) => void;
 }): Promise<Clip[]> {
@@ -355,6 +356,7 @@ export async function buildClips(opts: {
         assFile: burnBin ? assName : undefined,
         bin: burnBin ?? undefined,
         cwd: opts.clipsDir,
+        bgPath: opts.mobileBg,
       });
     }
 

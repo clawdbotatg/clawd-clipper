@@ -19,6 +19,7 @@ import {
   type LiveLine,
 } from "./speakers.js";
 import { composeLayout, detectClipWindows, type ClipLayout, type DetectedWindow } from "./vertical.js";
+import { renderMobileBackground } from "./desktop-bg.js";
 
 // CLI: clip an episode end-to-end.
 //
@@ -279,6 +280,16 @@ async function main() {
     }
   }
 
+  // Mobile (--vertical): render the slop-desktop background once (cached), to sit
+  // behind the stacked tiles. Null on failure → clips still cut, just full-frame.
+  let mobileBg: string | undefined;
+  if (args.vertical) {
+    log(`\n▸ rendering mobile desktop background…`);
+    const bg = await renderMobileBackground(join(outDir, "mobile-bg.png"), { force: args.force, log: m => log(`  ${m}`) });
+    mobileBg = bg ?? undefined;
+    log(`  ${bg ? "✓ " + bg : "skipped — clips will be full-frame stacks"}`);
+  }
+
   log(`\n▸ cutting clips…`);
   const clips = await buildClips({
     source,
@@ -289,6 +300,7 @@ async function main() {
     burn: args.burn,
     vertical: args.vertical,
     layouts,
+    mobileBg,
     limit: args.limit,
     log: m => log(`  ${m}`),
   });

@@ -1,4 +1,4 @@
-import { extractFrame, type StackTile } from "./ffmpeg.js";
+import { extractFrame, mobileSeamFrac, type StackTile } from "./ffmpeg.js";
 import { completeVision, extractJson } from "./llm.js";
 import { config } from "./config.js";
 import { detectWindowsPixels, loadFrameRGB } from "./pixels.js";
@@ -393,21 +393,24 @@ export function composeLayout(
   });
   const screenTile = (w: DetectedWindow, weight: number): StackTile => ({ ...wholeCrop(w, srcW, srcH, SCREEN_INSET), weight, fit: "contain" });
 
+  // seamFrac is the caption position. Tiles are composited into the video area
+  // (below the title bar, padded top/bottom), so the seam BETWEEN tiles maps from
+  // a within-area fraction to a full-frame fraction via mobileSeamFrac.
   // Speaker camera over a shared screen — slop's "interview" layout.
   if (content && primaryCam) {
-    return { tiles: [camTile(primaryCam, 0.42), screenTile(content, 0.58)], seamFrac: 0.42, kind: "interview", speakers };
+    return { tiles: [camTile(primaryCam, 0.42), screenTile(content, 0.58)], seamFrac: mobileSeamFrac(0.42), kind: "interview", speakers };
   }
   // Two speakers, no screen — stack their cameras 50/50.
   if (primaryCam && secondCam) {
-    return { tiles: [camTile(primaryCam, 0.5), camTile(secondCam, 0.5)], seamFrac: 0.5, kind: "two-up", speakers };
+    return { tiles: [camTile(primaryCam, 0.5), camTile(secondCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers };
   }
-  // One camera — fill the frame, caption low so it stays off the face.
+  // One camera — fill the video area, caption low so it stays off the face.
   if (primaryCam) {
-    return { tiles: [camTile(primaryCam, 1)], seamFrac: 0.85, kind: "solo", speakers };
+    return { tiles: [camTile(primaryCam, 1)], seamFrac: mobileSeamFrac(0.85), kind: "solo", speakers };
   }
   // No camera but a real screen — show it full.
   if (content) {
-    return { tiles: [screenTile(content, 1)], seamFrac: 0.85, kind: "screen", speakers };
+    return { tiles: [screenTile(content, 1)], seamFrac: mobileSeamFrac(0.85), kind: "screen", speakers };
   }
   return blur;
 }
