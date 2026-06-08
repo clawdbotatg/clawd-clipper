@@ -125,10 +125,12 @@ export async function probeSize(file: string): Promise<{ width: number; height: 
 let libassChecked: string | null | undefined;
 export function libassBin(): string | null {
   if (libassChecked !== undefined) return libassChecked;
-  // An explicit override is trusted as-is; otherwise prefer ffmpeg-full if its
-  // binary is actually present on disk.
-  const candidate = process.env.CLIPPER_FFMPEG_FULL_BIN?.trim() || config.ffmpegFullBin;
-  libassChecked = candidate && existsSync(candidate) ? candidate : null;
+  // Prefer the configured ffmpeg-full. A bare command name (no slash, e.g.
+  // "ffmpeg") is resolved via PATH at spawn time, so trust it as-is; a path is
+  // verified on disk. (Previously a bare name failed existsSync and silently
+  // disabled caption burning — set CLIPPER_FFMPEG_FULL_BIN=ffmpeg → no captions.)
+  const candidate = (process.env.CLIPPER_FFMPEG_FULL_BIN?.trim() || config.ffmpegFullBin || "").trim();
+  libassChecked = !candidate ? null : candidate.includes("/") ? (existsSync(candidate) ? candidate : null) : candidate;
   return libassChecked;
 }
 
