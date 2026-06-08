@@ -22,7 +22,10 @@ export type ClipBundleEntry = {
   durationSec: number;
   speakers: string[];
   mobile: { cid: string; w: number; h: number; format: string; sizeBytes: number };
-  poster?: { cid: string; format: string };
+  poster?: { cid: string; format: string }; // 9:16 first-frame
+  /** The 16:9 landscape cut (Clip.file) + its own poster — published alongside
+   *  the 9:16 so the admin view offers both formats for posting. */
+  landscape?: { cid: string; format: string; sizeBytes: number; poster?: { cid: string; format: string } };
   captions?: { cid: string; format: string };
   tweetShort?: string;
   tweetLong?: string;
@@ -87,6 +90,25 @@ export async function publishClips(opts: {
       }
     }
 
+    // 16:9 landscape cut (Clip.file) — pin it + a poster so the admin view can
+    // offer both formats side by side for posting.
+    let landscape: ClipBundleEntry["landscape"];
+    if (c.file && (await exists(join(opts.clipsDir, c.file)))) {
+      const lPath = join(opts.clipsDir, c.file);
+      const l = await pinFile(opts.apiUrl, lPath);
+      let lposter: { cid: string; format: string } | undefined;
+      if (opts.posters !== false) {
+        const lpp = `${lPath}.poster.jpg`;
+        if (await makePoster(lPath, lpp)) {
+          const p = await pinFile(opts.apiUrl, lpp);
+          lposter = { cid: `ipfs://${p.cid}`, format: "image/jpeg" };
+          await rm(lpp, { force: true });
+        }
+      }
+      landscape = { cid: `ipfs://${l.cid}`, format: "video/mp4", sizeBytes: l.size, poster: lposter };
+      log(`  [${i + 1}/${withMobile.length}] + landscape ${c.file} → ${l.cid}`);
+    }
+
     let captions: ClipBundleEntry["captions"];
     if (c.srt && (await exists(join(opts.clipsDir, c.srt)))) {
       const s = await pinFile(opts.apiUrl, join(opts.clipsDir, c.srt));
@@ -102,6 +124,7 @@ export async function publishClips(opts: {
       speakers: (c.speakers ?? []).map(s => s.speaker),
       mobile: { cid: `ipfs://${mobile.cid}`, w: W, h: H, format: "video/mp4", sizeBytes: mobile.size },
       poster,
+      landscape,
       captions,
       tweetShort: c.tweetShort,
       tweetLong: c.tweetLong,
