@@ -19,6 +19,7 @@ import {
   type LiveLine,
 } from "./speakers.js";
 import { composeLayout, detectClipWindows, type ClipLayout, type DetectedWindow } from "./vertical.js";
+import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
 import { publishClips } from "./publish.js";
 import { config } from "./config.js";
@@ -170,12 +171,16 @@ async function main() {
   // aligned to the re-transcription, and tally the dominant speaker per clip
   // window. Best-effort + no AI — no live transcript or no alignment just leaves
   // speakers unset. Surfaced on every clip in the gallery + index.json.
+  // Recovered video↔wall-clock offset, reused by the geometry-log layout below
+  // (geometry events share the live transcript's wall clock).
+  let alignOffsetMs: number | null = null;
   if (resolvedCands.length && ep.manifest.transcript?.cid) {
     log(`\n▸ attributing speakers…`);
     const names = namesFromParticipants(ep.manifest.participants);
     const live = await fetchLiveTranscript(ep.manifest.transcript.cid, names);
     const align = alignToVideo(live, transcript);
     if (align.offsetMs != null) {
+      alignOffsetMs = align.offsetMs;
       for (const c of resolvedCands) {
         const info = attributeWindow(live, align.offsetMs, c.start, c.end);
         if (info.primary) {
@@ -261,17 +266,43 @@ async function main() {
     if (!missing.length) {
       log(`  loaded cached windows`);
     } else {
+      // Geometry-log fast path: if the relay logged exact window rects, replay
+      // them to each clip's mid-frame — no vision/pixel pass. Time anchor is the
+      // offset recovered from the transcript (geometry shares its wall clock),
+      // falling back to the log header's videoStartMs. CV stays the per-clip
+      // fallback for anything the log can't cover (gaps, off-frame, older eps).
+      let geomLog: GeometryLog | null = null;
+      if (ep.manifest.geometry?.cid) {
+        try {
+          geomLog = await fetchGeometryLog(ep.manifest.geometry.cid);
+          log(`  geometry log: ${geomLog.events.length} events (manifest.geometry)`);
+        } catch (err) {
+          log(`  geometry log fetch failed, using vision (${err instanceof Error ? err.message : err})`);
+        }
+      }
+      const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
+      const geomNames = namesFromParticipants(ep.manifest.participants);
+
       const framesDir = join(outDir, "frames");
       await mkdir(framesDir, { recursive: true });
       for (const c of missing) {
         const key = clipKey(c);
-        windows[key] = await detectClipWindows({
-          source,
-          framePath: join(framesDir, `${key}.png`),
-          startSec: c.start,
-          endSec: c.end,
-          log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
-        });
+        let wins: DetectedWindow[] = [];
+        if (geomLog && geomOffsetMs != null) {
+          const midMs = ((c.start + c.end) / 2) * 1000 + geomOffsetMs;
+          wins = windowsAt(geomLog, midMs, geomNames);
+          if (wins.length) log(`  ${c.title.slice(0, 36)} — ${wins.length} windows from geometry log`);
+        }
+        if (!wins.length) {
+          wins = await detectClipWindows({
+            source,
+            framePath: join(framesDir, `${key}.png`),
+            startSec: c.start,
+            endSec: c.end,
+            log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
+          });
+        }
+        windows[key] = wins;
       }
       await writeFile(windowsPath, JSON.stringify(windows, null, 2));
     }
