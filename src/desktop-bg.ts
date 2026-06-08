@@ -129,13 +129,18 @@ export async function renderMobileBackground(
   opts: { force?: boolean; htmlPath?: string; log?: (m: string) => void } = {},
 ): Promise<string | null> {
   const log = opts.log ?? (() => {});
-  if (!opts.force && (await exists(destPng))) return destPng;
-  if (!(await exists(CHROME))) {
-    log(`no Chrome at ${CHROME} — skipping desktop background`);
-    return null;
-  }
   const W = MOBILE_FRAME.W;
   const H = MOBILE_FRAME.H;
+  // Prefer the committed, pre-rendered background — the desktop is static at a
+  // fixed frame size, so this PNG ships with the repo and NO Chrome is needed in
+  // the normal/server path. Only re-render (Chrome) when --force or it's absent.
+  const bundled = join(ASSETS, `desktop-${W}x${H}.png`);
+  if (!opts.force && (await exists(bundled))) return bundled;
+  if (!opts.force && (await exists(destPng))) return destPng;
+  if (!(await exists(CHROME))) {
+    log(`no Chrome at ${CHROME} and no bundled background — skipping desktop background`);
+    return null;
+  }
   const htmlPath = opts.htmlPath ?? destPng.replace(/\.png$/, ".html");
   await writeFile(htmlPath, buildHtml(W, H));
   try {

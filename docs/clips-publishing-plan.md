@@ -1,95 +1,101 @@
-# Clips publishing — cross-repo plan
+# Clips publishing — cross-repo plan (server-side)
 
-**Goal:** every episode page (`https://slop.computer/<slug>`) shows, at the
-bottom, the AI-generated **9:16 vertical clips** + their **suggested tweet copy**
-(short + long) that `clawd-clipper` already produces — automatically, from the
-episode's manifest, with at most one extra button in `/admin`.
+**Goal:** when you finish an episode in `/admin`, **one more button** —
+"Generate clips" — makes the server cut the AI 9:16 vertical clips + tweet copy,
+pin them to IPFS, fold them into the manifest, and push the one on-chain update.
+A minute later `https://slop.computer/<slug>` shows a **Clips** section at the
+bottom. No laptop, no manual CID paste.
 
-**Today:** `clawd-clipper` produces, under `out/<slug>/`:
-- `clips/NN_*.mobile.mp4` — 1080×1920 clips (stacked speaker tiles on the slop
-  desktop background, captions burned on the seam),
-- `clips/NN_*.mp4` / `.srt` — the 16:9 cut + captions,
-- `index.json` — ranked clips with `title`, `start`, `end`, `speakers`,
-  `tweetShort`, `tweetLong`, `mobileFile`, `srt`, `captionText`,
-- a local `index.html` gallery (with copy buttons).
+It's part of the normal publishing process, right after Pin → Save Manifest.
+**The server does all the heavy lifting; you sign the one tx** (your wallet, the
+same `setManifest` you already use — no server key, no contract change):
 
-That output never leaves the laptop. This plan ships it.
+```
+/admin:  [Check] → [Pin to IPFS] → [Save Manifest] → [Generate clips] → [Save Manifest]
+                        │                │                  │                  │
+                   video+chat+      manifest v1      server cuts clips,   you sign the
+                   transcript+card   on-chain        pins them, builds    prefilled v2 CID
+                   → manifest v1                     manifest v2 → CID    (one wallet click)
+```
+
+The new **Generate clips** button runs the whole server job and hands back the
+new manifest CID, prefilled into the manifest field; you click **Save Manifest**
+once more to push it on-chain. Then the Clips section appears on the episode page.
 
 ---
 
-## The one design decision: clips attach AFTER finalize
+## Why this slots in cleanly after finalize
 
-The relay's `finalizeRecording` (`slop-computer-live/packages/relay/src/recordings.ts`)
-pins the **video** first, then transcript/chat/card, then builds + pins
-`manifest.json`, then the admin calls `setManifest(id, ipfs://<cid>)` on-chain.
+Clips depend on the **finalized video** (the job downloads/loads the episode mp4
+and runs ffmpeg + an LLM for clip selection + tweets — a minute or two of work),
+so they can't be part of the initial finalize pin. They attach as a **manifest
+update**: take manifest v1, add a `clips` field, pin v2, `setManifest` again. The
+on-chain `manifest` string is already mutable (`SlopComputer.sol:setManifest`),
+so this is just a second call — triggered by the new button instead of by hand.
 
-Clips **depend on that finalized video** (the clipper downloads the episode mp4
-and runs vision + ffmpeg + headless Chrome — minutes of work, plus an Anthropic
-API key). So clips can't be part of the initial finalize. They attach as a
-**manifest update**: produce a *new* manifest JSON = old manifest + a `clips`
-field, pin it, and `setManifest` to the new CID. The on-chain `manifest` string
-is already mutable via `setManifest` (`SlopComputer.sol:setManifest`), so this is
-just a second, later call — no contract change.
+Keeping it a separate step (not inside `finalizeRecording`) means finalize stays
+fast and the heavy clip job can run in the background and stream progress, exactly
+like the existing finalize NDJSON stream.
 
-This also keeps the heavy clipper OFF the relay's finalize path (which must stay
-fast and not need a vision API key or Chrome).
+---
 
-```
-record ──▶ /admin finalize ──▶ manifest v1 (video/transcript/chat/card) ──▶ setManifest
-                                                                                  │
-                                              (episode is live, no clips yet)     │
-                                                                                  ▼
-host runs:  clawd-clipper <slug> --vertical --publish
-              ├─ make clips + tweets (existing)
-              ├─ pin each .mobile.mp4 (+ .srt) to IPFS
-              ├─ pin clips.json (timings + tweets + per-clip CIDs)  ─▶ clipsCid
-              └─ fetch manifest v1, add `clips`, pin manifest v2     ─▶ newManifestCid
-                                                                                  │
-            /admin ▶ paste newManifestCid ▶ "Save manifest"  (setManifest) ◀──────┘
-                                                                                  ▼
-                          slop.computer/<slug> renders the Clips section
-```
+## Two things that make the server job light
 
-The only manual step: paste one CID into `/admin` and hit save (the button you
-said is fine).
+1. **The desktop background is static.** It's the same slop-computer mobileMode
+   desktop (title bar + icon grid + watermark) at 1080×1920 for every clip. We
+   **pre-render it once** with headless Chrome (locally, during this work) and
+   **commit the PNG as an asset**. The server composites clips over that PNG with
+   plain ffmpeg — **no Chrome on the server**.
+2. **The LLM is already there.** Finalize already calls a model (the
+   `generating-meta` phase), so the API key is on the server — that covers clip
+   ranking + tweet copy. And once the **geometry log** lands (see
+   `window-geometry-log.md`), window rects come from the log, so the job needs
+   **no vision/CV for geometry either**. Net server deps: ffmpeg (already) + the
+   existing LLM key + the bundled background PNG.
+
+---
+
+## On-chain: you sign it (no contract change, no server key)
+
+**Decision:** the server never holds a key and the contract is untouched.
+`setManifest` stays `onlyOwner` and you sign it from your browser wallet — exactly
+like today. The clips job's only job is to produce the new manifest CID; the
+button prefills it into the existing manifest field and you hit **Save Manifest**.
+
+So the on-chain flow is unchanged; there's just a new manifest CID to save after
+the clip job runs. (If you ever want it fully hands-off later, a low-privilege
+"publisher" role on the contract + a server key would remove that last click —
+but that's explicitly out of scope here.)
 
 ---
 
 ## Data format
 
-### `clips.json` (the clips bundle, pinned to IPFS)
-
-Self-contained; the frontpage fetches it from `manifest.clips.cid` and renders
-without any other lookups. CIDs are `ipfs://…` so the frontpage's existing
-`gatewayUrl()` resolves them.
+### `clips.json` (pinned to IPFS; the frontpage reads only this)
 
 ```jsonc
 {
   "v": 1,
   "slug": "binji-x",
-  "generatedAt": "2026-06-07T19:11:00Z",   // stamped by --publish
+  "generatedAt": "2026-06-07T19:11:00Z",
   "clips": [
     {
       "rank": 1,
       "title": "Worst time to be a junior dev, best time to be solo",
-      "startSec": 1920.62,
-      "endSec": 1949.86,
-      "durationSec": 29.24,
+      "startSec": 1920.62, "endSec": 1949.86, "durationSec": 29.24,
       "speakers": ["austingriffith.eth", "binji"],
-      "mobile": { "cid": "ipfs://bafy…", "w": 1080, "h": 1920, "format": "video/mp4", "sizeBytes": 15166546 },
-      "landscape": { "cid": "ipfs://bafy…", "format": "video/mp4" },   // optional
-      "captions": { "cid": "ipfs://bafy…", "format": "application/x-subrip" }, // .srt, optional
+      "mobile":   { "cid": "ipfs://bafy…", "w": 1080, "h": 1920, "format": "video/mp4", "sizeBytes": 15166546 },
+      "poster":   { "cid": "ipfs://bafy…", "format": "image/jpeg" },   // first-frame, optional
+      "captions": { "cid": "ipfs://bafy…", "format": "application/x-subrip" }, // optional
       "tweetShort": "Worst time in history to be a junior dev. Best time ever to be a solo founder.",
-      "tweetLong": "austingriffith.eth's take: it's a terrible time to be a junior developer, but …"
+      "tweetLong":  "austingriffith.eth's take: it's a terrible time to be a junior developer, but …"
     }
-    // … one per clip, already in rank order
+    // … one per clip, rank order
   ]
 }
 ```
 
-### Manifest field (`slop-computer-frontpage/packages/nextjs/types/episode.ts`)
-
-Mirror the existing `transcript`/`chat`/`card` shape — purely additive:
+### Manifest field (`frontpage/packages/nextjs/types/episode.ts`) — additive
 
 ```ts
 export type EpisodeManifest = {
@@ -99,142 +105,98 @@ export type EpisodeManifest = {
 };
 ```
 
-> Scope note like the geometry log: this is additive. Whatever parses/re-emits
-> the manifest must **not strip unknown fields** — keep `clips` intact.
+> Additive, like the geometry log: anything that re-emits the manifest must keep
+> unknown fields (`clips`) intact.
 
 ---
 
-## Changes to `clawd-clipper`
+## Changes by repo
 
-A new **`--publish`** step (only runs when asked; no behaviour change otherwise).
-New file `src/publish.ts`, invoked from `src/index.ts` after `buildClips`.
+### 1. `slop-computer-live` (relay) — the worker + the route
 
-1. **Config** (`src/config.ts`): add
-   - `ipfsApiUrl` (kubo `/api/v0/add` endpoint — same one the relay uses, e.g.
-     `http://127.0.0.1:5001`),
-   - read from env (`IPFS_API_URL`). If absent and `--publish` is passed, error
-     with instructions (don't silently skip).
+- **Port the clipper into the relay** as a package/module
+  (`packages/relay/src/clips/…`), or vendor it as a dependency. It already shares
+  the stack (Node + ffmpeg). Reuse the existing kubo pin helpers
+  (`ipfs.ts:pinBlob`, `recordings.ts:pinToLocalIpfs`) — no new pinning code.
+- **New route** `POST /admin/generate-clips?slug=` (mirror `/admin/finalize`):
+  auth via `requireHost`, stream NDJSON progress
+  (`{phase:"cutting", i, n}`, `{phase:"pinning-clips", count}`,
+  `{phase:"updating-manifest"}`, `{phase:"done", manifestCid}`), run in the
+  background like finalize does.
+- **The job** (mirrors `finalizeRecording`'s pin → manifest pattern; **no signing**):
+  1. Locate the finalized mp4 on disk (the same file finalize just pinned) and
+     the current manifest (resolve the episode's manifest CID).
+  2. Cut clips over the bundled background PNG; build tweet copy via the existing
+     LLM client.
+  3. Pin each `.mobile.mp4` (+ poster + srt) → CIDs; build + pin `clips.json` →
+     `clipsCid`.
+  4. Fetch manifest v1, add `clips: {cid:"ipfs://"+clipsCid, count}`, pin → v2.
+  5. Emit `done` with the new manifest CID — the server stops here, the admin
+     signs `setManifest` in the browser.
+- **Background-job hygiene:** one job per slug at a time; idempotent (re-running
+  repins + re-points the manifest; old artifacts stay pinned).
 
-2. **Pin helper** (`src/publish.ts`): copy the relay's tiny `pinBlob` /
-   `pinToLocalIpfs` pattern (`slop-computer-live/packages/relay/src/ipfs.ts`,
-   `recordings.ts:pinToLocalIpfs`) — POST a `FormData` blob to
-   `${ipfsApiUrl}/api/v0/add?pin=true`, parse the last NDJSON line's `Hash`.
-   Stream the mp4s (they're ~15 MB each, 16 clips ≈ 250 MB total).
+### 2. `slop-computer-frontpage` — the button, the section, the checklist
 
-3. **Publish flow** (`src/publish.ts`, called when `args.publish`):
-   - For each clip: pin `<base>.mobile.mp4` (+ `.srt` if present, + landscape
-     `.mp4` if we want it) → collect CIDs.
-   - Build `clips.json` from `index.json`'s clips (rank/title/start/end/speakers/
-     tweetShort/tweetLong) + the pinned CIDs. Stamp `generatedAt` (pass the
-     timestamp in — `Date.now()` is fine here, this is a one-shot CLI).
-   - Pin `clips.json` → `clipsCid`.
-   - **Augment the manifest**: fetch the current manifest JSON from
-     `ep.manifest` (the clipper already resolves the episode + manifest CID in
-     `resolve.ts`), add `clips: { cid: "ipfs://"+clipsCid, count, format }`,
-     pin → `newManifestCid`.
-   - Print clearly:
-     ```
-     ✓ clips bundle: ipfs://<clipsCid>  (16 clips, 251 MB)
-     ✓ updated manifest: ipfs://<newManifestCid>
-       → paste this into /admin "Manifest CID" and Save.
-     ```
+- **Admin** (`app/admin/page.tsx`): add a **"Generate clips"** action in the
+  Finalize panel, after Save Manifest. It POSTs to `/admin/generate-clips?slug=`,
+  renders the streamed progress (reuse the finalize NDJSON stream UI), and on
+  `done` **prefills the new manifest CID into the manifest field** so you click
+  the existing **Save Manifest** to sign it. (Same `saveManifest()` /
+  `writeContractAsync({ functionName: "setManifest" })` already in the panel.)
+- **Type** (`types/episode.ts`): add the `clips?` field.
+- **Episode page** (`components/EpisodeView.tsx`): manifest is already loaded via
+  `fetchManifest`; add a bottom section
+  `{manifest?.clips?.[0]?.cid ? <ClipsSection bundleUrl={…}/> : null}`.
+- **`ClipsSection`** (new): fetch `clips.json` from the CID, render a responsive
+  row of 9:16 `<video controls preload="none" poster=…>` (src via the existing
+  `gatewayUrl()`), each with title, speakers, and the **short/long tweet + copy
+  buttons** — port the markup + styles straight from
+  `clawd-clipper/src/gallery.ts`. `preload="none"` so 16 players don't hammer the
+  gateway.
+- **Checklist** (`checklist.md` + the interactive `app/checklist/page.tsx`): add a
+  step in the post-show / finalize section, right after "Save Manifest":
+  > - [ ] On `slop.computer/admin` → **Generate clips** → wait for it to finish →
+  >   **Save Manifest** again (CID is prefilled) to push the clips on-chain.
+  >   Confirm the **Clips** section shows at the bottom of `slop.computer/<slug>`.
 
-4. **CLI** (`src/index.ts` `parseArgs`): add `--publish` (default false), and
-   gate the publish step behind it (and `args.vertical`, since clips need the
-   mobile mp4s).
-
-No on-chain writes from the clipper (keeps the deployer key out of the tool). The
-clipper stops at "here's the manifest CID."
+  `checklist.md` is the canonical list; mirror the same item into the React
+  checklist so it shows up as a real step (optionally with a live check that the
+  current manifest has a `clips` field).
 
 ---
 
-## Changes to `slop-computer-frontpage`
+## Pre-render the background now (removes the Chrome dep)
 
-1. **Type** (`types/episode.ts`): add the `clips?` field above. Optionally export
-   a `ClipsBundle` / `Clip` type matching `clips.json`.
-
-2. **Fetch + render** (`components/EpisodeView.tsx`): the manifest is already
-   loaded via `fetchManifest(episode.manifest)`. Add a bottom section (after the
-   existing metadata sections, ~line 535):
-   ```tsx
-   {manifest?.clips?.[0]?.cid ? <ClipsSection bundleUrl={manifest.clips[0].cid} /> : null}
-   ```
-   `ClipsSection` (new component):
-   - `fetch(gatewayUrl(bundleUrl))` → `clips.json`,
-   - render a responsive grid/scroller of 9:16 `<video controls preload="none"
-     poster=…>` (src = `gatewayUrl(clip.mobile.cid, filename)`), each with title,
-     speakers, and the **short/long tweet with copy buttons** (port the markup +
-     `.tweets`/`.tw`/`copy` styles straight from `clawd-clipper/src/gallery.ts`),
-   - lazy-load videos (`preload="none"`) so 16 players don't hammer the gateway.
-
-3. **Admin** (`app/admin/page.tsx`): smallest possible change — the page already
-   has `setManifest` wiring (`saveManifest()` writes `ipfs://<manifestCid>`). Add
-   a **"Manifest CID"** text input + "Save" that calls the same `setManifest`
-   with the pasted CID. (Today `manifestCid` comes only from the finalize stream;
-   this lets you set the clipper's `newManifestCid` later.) That's the one button.
-
-No relay changes required in this approach — the clipper pins directly to the same
-kubo node. (If we'd rather the relay own all pinning, a `/admin/attach-clips`
-endpoint is the alternative; see below.)
+`clawd-clipper/src/desktop-bg.ts` already renders the 1080×1920 desktop PNG via
+Chrome. We run it once, commit the result as
+`assets/mobile/desktop-1080x1920.png`, and have the compositor use the committed
+PNG when present (rendering on the fly only as a dev convenience). The relay then
+ships that PNG and never needs Chrome.
 
 ---
 
 ## Admin workflow (what you actually do)
 
-1. Finish the stream → `/admin` → **Pin to IPFS** → **Save Manifest** (today's
-   flow; episode goes live without clips).
-2. On your machine: `IPFS_API_URL=http://127.0.0.1:5001 yarn clip binji-x --vertical --publish`
-   (kubo running — the same node the relay pins to, or any reachable kubo).
-3. Copy the printed `ipfs://<newManifestCid>`.
-4. `/admin` → paste into **Manifest CID** → **Save**. (one tx)
-5. `slop.computer/binji-x` now shows the Clips section.
+1. Finish stream → `/admin` → **Pin to IPFS** → **Save Manifest** (today).
+2. Click **Generate clips**. Watch the progress stream (~1–2 min) while the
+   server cuts + pins everything and builds the new manifest.
+3. The new manifest CID is prefilled → click **Save Manifest** again (your wallet
+   signs the one tx).
+4. Done — `slop.computer/<slug>` shows the Clips section.
 
-Re-running the clipper + repasting updates clips idempotently (new manifest CID
-each time; old artifacts stay pinned).
-
----
-
-## IPFS / pinning notes
-
-- **Where it pins:** the clipper needs a kubo `/api/v0/add` endpoint. Easiest is
-  the same node the relay uses (`config.ipfsApiUrl` over there). If the host runs
-  the clipper on the relay box (or kubo's API is reachable), reuse it; otherwise
-  run a local kubo or point at a pinning service that exposes the kubo add API.
-- **Size:** ~16 × 15 MB mobile mp4s ≈ 250 MB per episode. Add landscape cuts and
-  it ~doubles. Decide whether to pin landscape too (probably mobile-only for the
-  page; landscape is the existing per-clip download if wanted).
-- **Gateway:** the frontpage already serves IPFS via
-  `NEXT_PUBLIC_IPFS_GATEWAY` (`media.slop.computer/ipfs`) and `gatewayUrl()` —
-  clip `<video src>` uses it unchanged.
-- **Posters:** optionally pin a JPg first-frame per clip for `<video poster>` so
-  the grid isn't 16 black boxes before play. Cheap to add in `--publish`.
-
----
-
-## Alternative considered (relay-owned pinning)
-
-Instead of the clipper pinning, add a relay endpoint
-`POST /admin/attach-clips?slug=` that accepts the clip files (or a clips.json the
-clipper already built with CIDs), pins what's missing, augments + pins the
-manifest, and returns `newManifestCid`. The admin button then drives that.
-
-- **Pro:** one place owns kubo; the clipper never touches IPFS; admin uploads
-  files through the relay.
-- **Con:** pushing 250 MB through the relay HTTP API; more relay code; the
-  clipper would have to upload raw files. The recommended approach (clipper pins
-  to kubo directly, admin just sets the CID) is less moving-parts and mirrors how
-  the geometry-log plan keeps the clipper as the IPFS producer.
+This is captured as a checklist step so it's part of the routine (see above).
+Local `yarn clip <slug> --vertical --publish` stays as a **dev/back-catalog
+fallback** for re-cutting old episodes by hand.
 
 ---
 
 ## Open questions for you
 
-1. **Pin target:** is the relay's kubo reachable from where you run the clipper,
-   or should `--publish` point at a separate kubo / pinning service?
-2. **Landscape clips on the page too, or mobile-only?** (affects pin size)
-3. **Posters:** want first-frame JPgs for the `<video>` grid? (nicer, +small pin)
-4. **Manifest update UX:** a bare "Manifest CID" box in `/admin`, or a dedicated
-   "Attach clips (paste clips CID)" box that fetches+augments+pins the manifest
-   in-browser via a relay helper? The former is ~zero code; the latter is one
-   button that does everything but needs a small relay/SDK pin call.
-```
+1. **Posters?** First-frame JPGs make the grid look alive instead of 16 black
+   boxes — small extra pin, recommend yes.
+2. **Mobile-only on the page, or landscape too?** (mobile-only ≈ 250 MB/episode)
+
+(On-chain is settled: you sign `setManifest` in the browser — no contract change,
+no server key. A fully-auto publisher role is a possible later upgrade, out of
+scope here.)
