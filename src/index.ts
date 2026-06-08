@@ -271,14 +271,25 @@ async function main() {
       // offset recovered from the transcript (geometry shares its wall clock),
       // falling back to the log header's videoStartMs. CV stays the per-clip
       // fallback for anything the log can't cover (gaps, off-frame, older eps).
+      // OPT-IN: the geometry log records the relay's interactive god-desktop slot
+      // positions, but the OBS-recorded video is a *different* composition (windows
+      // re-arranged / clamped at the broadcast viewport), so replayed rects don't
+      // line up with the recorded pixels — verified on clawdbotatg: two cameras
+      // can't be reconciled by a single affine. Until the upstream logs the
+      // BROADCAST composition's coords (not the slot coords), default to the pixel
+      // detector, which reads the actual recorded frame. Set CLIPPER_USE_GEOMETRY=1
+      // to re-enable once that calibration is solved.
+      const useGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
       let geomLog: GeometryLog | null = null;
-      if (ep.manifest.geometry?.cid) {
+      if (useGeometry && ep.manifest.geometry?.cid) {
         try {
           geomLog = await fetchGeometryLog(ep.manifest.geometry.cid);
-          log(`  geometry log: ${geomLog.events.length} events (manifest.geometry)`);
+          log(`  geometry log: ${geomLog.events.length} events (manifest.geometry, CLIPPER_USE_GEOMETRY)`);
         } catch (err) {
-          log(`  geometry log fetch failed, using vision (${err instanceof Error ? err.message : err})`);
+          log(`  geometry log fetch failed, using pixels (${err instanceof Error ? err.message : err})`);
         }
+      } else if (ep.manifest.geometry?.cid) {
+        log(`  geometry log present but disabled (recording composition ≠ slot coords); using pixel detector. CLIPPER_USE_GEOMETRY=1 to override.`);
       }
       const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
       const geomNames = namesFromParticipants(ep.manifest.participants);
