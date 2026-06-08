@@ -16,12 +16,13 @@ export const config = {
   // SlopComputer is on Ethereum mainnet.
   contract: (env("SLOP_CONTRACT") || "0xf3ce3614fe8cd4294a0bf05d10cfda9d9cbc4886").toLowerCase() as `0x${string}`,
 
-  // Self-hosted kubo gateway behind Caddy (same default the frontpage uses).
+  // Self-hosted bgipfs gateway behind Caddy (same default the frontpage uses).
   ipfsGateway: env("IPFS_GATEWAY") || "https://media.slop.computer/ipfs",
-  // kubo RPC API (/api/v0/add) for PINNING clips during `--publish`. No default
-  // — publishing requires it explicitly (e.g. http://127.0.0.1:5001), the same
-  // node the relay pins to. Read-only runs (clipping without --publish) ignore it.
-  ipfsApiUrl: env("IPFS_API_URL"),
+  // IPFS HTTP API (/api/v0/add) for PINNING clips during `--publish` — the same
+  // node + endpoint the rest of slop pins to (bgipfs in prod, a colocated daemon
+  // in dev). Same default as the relay (IPFS_API_URL, :5001). Read-only runs
+  // (clipping without --publish) ignore it.
+  ipfsApiUrl: env("IPFS_API_URL") || "http://127.0.0.1:5001",
 
   // whisper-1 is the only OpenAI model that returns word-level timestamps
   // (verbose_json + timestamp_granularities). gpt-4o-transcribe does not.

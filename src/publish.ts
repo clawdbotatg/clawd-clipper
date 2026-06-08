@@ -7,7 +7,7 @@ import { pinFile, pinJson } from "./ipfs.js";
 import type { EpisodeManifest, ResolvedEpisode } from "./resolve.js";
 
 // Publish a clipped episode's 9:16 clips to IPFS and produce an updated manifest:
-//   1. pin each .mobile.mp4 (+ a poster jpg + .srt) to the kubo node,
+//   1. pin each .mobile.mp4 (+ a poster jpg + .srt) to IPFS (bgipfs),
 //   2. build & pin clips.json (timings + speakers + tweet copy + per-clip CIDs),
 //   3. fold a `clips` field into the episode manifest and pin the new manifest.
 // Returns the new manifest CID — the operator then signs setManifest with it

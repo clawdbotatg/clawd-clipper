@@ -116,7 +116,7 @@ export type EpisodeManifest = {
 
 - **Port the clipper into the relay** as a package/module
   (`packages/relay/src/clips/…`), or vendor it as a dependency. It already shares
-  the stack (Node + ffmpeg). Reuse the existing kubo pin helpers
+  the stack (Node + ffmpeg). Reuse the existing IPFS (bgipfs) pin helpers
   (`ipfs.ts:pinBlob`, `recordings.ts:pinToLocalIpfs`) — no new pinning code.
 - **New route** `POST /admin/generate-clips?slug=` (mirror `/admin/finalize`):
   auth via `requireHost`, stream NDJSON progress

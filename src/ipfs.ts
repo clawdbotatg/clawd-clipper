@@ -1,14 +1,16 @@
 import { openAsBlob } from "node:fs";
 import { basename } from "node:path";
 
-// Pin bytes/files/JSON to a kubo node via its RPC API (/api/v0/add?pin=true),
-// the SAME mechanism the relay uses (slop-computer-live/packages/relay/src/ipfs.ts)
-// so clips land on the same IPFS node as the episode video/transcript/chat. kubo
-// streams NDJSON; the final line carries the root { Hash }.
+// Pin bytes/files/JSON to the SAME IPFS node the rest of slop pins to — bgipfs
+// in prod, a colocated daemon in dev — via its HTTP API `/api/v0/add?pin=true`
+// at IPFS_API_URL (default :5001). This is byte-for-byte the endpoint the relay
+// uses (slop-computer-live/packages/relay/src/ipfs.ts `pinBlob`), so clips land
+// on the same node as the episode video/transcript/chat. The response is NDJSON;
+// the last line with a Hash is the pinned root.
 
-async function addToKubo(apiUrl: string, body: FormData, what: string): Promise<{ cid: string; size: number }> {
-  const res = await fetch(`${apiUrl.replace(/\/$/, "")}/api/v0/add?pin=true&cid-version=1`, { method: "POST", body });
-  if (!res.ok) throw new Error(`kubo /api/v0/add (${what}) ${res.status}: ${(await res.text()).slice(-200)}`);
+async function ipfsAdd(apiUrl: string, body: FormData, what: string): Promise<{ cid: string; size: number }> {
+  const res = await fetch(`${apiUrl.replace(/\/$/, "")}/api/v0/add?pin=true`, { method: "POST", body });
+  if (!res.ok) throw new Error(`ipfs /api/v0/add (${what}) ${res.status}: ${(await res.text()).slice(-200)}`);
   // The response is one JSON object per line; the LAST with a Hash is the root.
   const text = await res.text();
   let cid = "";
@@ -25,7 +27,7 @@ async function addToKubo(apiUrl: string, body: FormData, what: string): Promise<
       /* skip non-JSON noise */
     }
   }
-  if (!cid) throw new Error(`kubo: ${what} returned no Hash`);
+  if (!cid) throw new Error(`ipfs: ${what} returned no Hash`);
   return { cid, size };
 }
 
@@ -34,7 +36,7 @@ export async function pinBytes(apiUrl: string, bytes: Buffer | Blob, filename: s
   const blob = bytes instanceof Blob ? bytes : new Blob([bytes]);
   const form = new FormData();
   form.append("file", blob, filename);
-  return (await addToKubo(apiUrl, form, filename)).cid;
+  return (await ipfsAdd(apiUrl, form, filename)).cid;
 }
 
 /** Pin a JSON value (pretty-printed). Returns the CID. */
@@ -47,5 +49,5 @@ export async function pinFile(apiUrl: string, path: string): Promise<{ cid: stri
   const blob = await openAsBlob(path);
   const form = new FormData();
   form.append("file", blob, basename(path));
-  return addToKubo(apiUrl, form, basename(path));
+  return ipfsAdd(apiUrl, form, basename(path));
 }
