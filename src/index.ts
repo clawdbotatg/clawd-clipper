@@ -316,7 +316,7 @@ async function main() {
   // /admin button (see docs/clips-publishing-plan.md).
   if (args.publish) {
     if (!config.ipfsApiUrl)
-      throw new Error("--publish needs IPFS_API_URL set (kubo /api/v0/add, e.g. http://127.0.0.1:5001 — the same node the relay pins to)");
+      throw new Error("--publish needs IPFS_API_URL set (bgipfs /api/v0/add, e.g. http://127.0.0.1:5001 — the same node the relay pins to)");
     log(`\n▸ publishing clips to IPFS…`);
     const { clipsCid, manifestCid } = await publishClips({
       ep,
