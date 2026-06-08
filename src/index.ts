@@ -326,6 +326,12 @@ async function main() {
       posters: true,
       log: m => log(m),
     });
+    // Machine-readable result so a caller (the relay's /admin/generate-clips
+    // route) can pick up the CIDs without scraping logs.
+    await writeFile(
+      join(outDir, "publish.json"),
+      JSON.stringify({ slug: args.slug, clipsCid: `ipfs://${clipsCid}`, manifestCid: `ipfs://${manifestCid}`, count: clips.filter(c => c.mobileFile).length, generatedAt: new Date().toISOString() }, null, 2),
+    );
     log(`\n✓ clips bundle:      ipfs://${clipsCid}`);
     log(`✓ updated manifest:  ipfs://${manifestCid}`);
     log(`  → slop.computer/admin → paste this manifest CID → Save Manifest (your wallet signs setManifest)`);
