@@ -18,6 +18,10 @@ export const config = {
 
   // Self-hosted kubo gateway behind Caddy (same default the frontpage uses).
   ipfsGateway: env("IPFS_GATEWAY") || "https://media.slop.computer/ipfs",
+  // kubo RPC API (/api/v0/add) for PINNING clips during `--publish`. No default
+  // — publishing requires it explicitly (e.g. http://127.0.0.1:5001), the same
+  // node the relay pins to. Read-only runs (clipping without --publish) ignore it.
+  ipfsApiUrl: env("IPFS_API_URL"),
 
   // whisper-1 is the only OpenAI model that returns word-level timestamps
   // (verbose_json + timestamp_granularities). gpt-4o-transcribe does not.

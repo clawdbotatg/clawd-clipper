@@ -20,6 +20,8 @@ import {
 } from "./speakers.js";
 import { composeLayout, detectClipWindows, type ClipLayout, type DetectedWindow } from "./vertical.js";
 import { renderMobileBackground } from "./desktop-bg.js";
+import { publishClips } from "./publish.js";
+import { config } from "./config.js";
 
 // CLI: clip an episode end-to-end.
 //
@@ -44,12 +46,13 @@ type Args = {
   burn: boolean;
   tweets: boolean;
   vertical: boolean;
+  publish: boolean;
   force: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false };
+  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
@@ -58,6 +61,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--no-burn") out.burn = false;
     else if (a === "--no-tweets") out.tweets = false;
     else if (a === "--vertical") out.vertical = true;
+    else if (a === "--publish") ((out.publish = true), (out.vertical = true)); // publish pins the 9:16 clips → implies --vertical
     else if (a === "--manifest") out.manifest = argv[++i];
     else if (a === "--limit") out.limit = Number(argv[++i]);
     else if (a === "--target") out.target = Number(argv[++i]);
@@ -66,7 +70,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (!positional[0])
     throw new Error(
-      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--force]",
+      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--force]",
     );
   return {
     slug: positional[0],
@@ -76,6 +80,7 @@ function parseArgs(argv: string[]): Args {
     burn: out.burn ?? true,
     tweets: out.tweets ?? true,
     vertical: out.vertical ?? false,
+    publish: out.publish ?? false,
     force: out.force ?? false,
   };
 }
@@ -304,6 +309,27 @@ async function main() {
     limit: args.limit,
     log: m => log(`  ${m}`),
   });
+
+  // Publish (--publish): pin the 9:16 clips + tweet copy to IPFS and produce an
+  // updated manifest CID. The operator then signs setManifest with it. This is
+  // the dev/back-catalog path; the server runs the same publishClips() on a
+  // /admin button (see docs/clips-publishing-plan.md).
+  if (args.publish) {
+    if (!config.ipfsApiUrl)
+      throw new Error("--publish needs IPFS_API_URL set (kubo /api/v0/add, e.g. http://127.0.0.1:5001 — the same node the relay pins to)");
+    log(`\n▸ publishing clips to IPFS…`);
+    const { clipsCid, manifestCid } = await publishClips({
+      ep,
+      clips,
+      clipsDir: join(outDir, "clips"),
+      apiUrl: config.ipfsApiUrl,
+      posters: true,
+      log: m => log(m),
+    });
+    log(`\n✓ clips bundle:      ipfs://${clipsCid}`);
+    log(`✓ updated manifest:  ipfs://${manifestCid}`);
+    log(`  → slop.computer/admin → paste this manifest CID → Save Manifest (your wallet signs setManifest)`);
+  }
 
   const generatedAt = new Date(t0).toISOString();
   await writeGallery({
