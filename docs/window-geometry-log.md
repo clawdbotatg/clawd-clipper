@@ -136,7 +136,7 @@ the same field was added there too.
 
 ---
 
-## How the clipper consumes it (+ fallback) — **REMAINING**
+## How the clipper consumes it (+ fallback) — **BUILT** (`src/geometry.ts`)
 
 In `clawd-clipper`, when resolving a clip's 9:16 layout (the `missing`-windows
 loop in `src/index.ts:~254`, which today calls `detectClipWindows()` in
@@ -186,11 +186,13 @@ entirely.
 | finalize pin + `manifest.geometry` | slop-computer-live | ✅ built, typechecks |
 | `EpisodeManifest.geometry` carry-through | slop-computer-frontpage | ✅ done |
 | `EpisodeManifest.geometry` in clipper type | clawd-clipper | ✅ done |
-| Fetch + replay + `DetectedWindow[]` adapter | clawd-clipper | ⬜ remaining |
-| Wire geometry-or-CV switch into `index.ts` | clawd-clipper | ⬜ remaining |
+| Fetch + replay + `DetectedWindow[]` adapter | clawd-clipper | ✅ built (`src/geometry.ts`) |
+| Wire geometry-or-CV switch into `index.ts` | clawd-clipper | ✅ built |
 | Verify coordinate-space calibration on a real clip | — | ⬜ needs a recorded episode |
 
-The relay/manifest half is end-to-end ready: the next episode finalized on the
-new relay build will pin a `geometry.jsonl` and reference it from the manifest.
-The clipper consumption can then be built and tested against that real artifact
-(which also resolves the coordinate-space question).
+The full pipeline is code-complete: the relay logs + pins `geometry.jsonl`, and
+the clipper reads it (replay verified on a synthetic log). The **only** thing
+left is empirical: run a show on the new relay build, then confirm the spatial
+calibration (layout px → frame fraction) on a real frame. Identity (1:1 at
+1920×1080) is the default; if the capture is scaled/cropped, set
+`CLIPPER_GEOM_LAYOUT_W/H` and `CLIPPER_GEOM_OFFSET_X/Y` — no code change.
