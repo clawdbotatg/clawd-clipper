@@ -226,8 +226,7 @@ async function main() {
           const marks =
             land(w.titleBar, "titlebar", "menu bar") +
             land(w.dots, "dots", "dots") +
-            land(w.face, "face", "face") +
-            land(w.nameCard, "namecard", "name");
+            land(w.nameCard, "namecard", "name"); // face box dropped — vision's was unreliable & unused
           return `<div class="box win" style="left:${pct(w.x)};top:${pct(w.y)};width:${pct(w.w)};height:${pct(w.h)};border-color:${color};background:${color}22;">
             <span class="tag" style="background:${color}">${esc(w.kind)}${w.label ? " · " + esc(w.label) : ""}</span>
           </div>${marks}`;

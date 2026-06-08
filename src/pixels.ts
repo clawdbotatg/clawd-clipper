@@ -583,3 +583,29 @@ export function traceWindows(f: RgbFrame, clusters: Box[]): WindowTrace[] {
   for (const d of clusters) if (!bars.some(b => b.d === d)) traces.push({ dots: d, isWindow: false });
   return traces;
 }
+
+/** A window's pixel-exact geometry: the dots cluster, the title-bar left/right
+ *  (= window left/right edges), the top (just above the bar) and the resolved
+ *  bottom (-1 if it couldn't be found). All in FRAME PIXELS. */
+export type PixelWindow = { dots: Box; left: number; right: number; top: number; bottom: number; bottomScore: number };
+
+/**
+ * Deterministic window geometry from a decoded frame — the validated pipeline:
+ * find every red/yellow/green cluster, keep the ones with a title bar (a real
+ * window, not a name-card icon), and resolve each box (left/right from the bar,
+ * bottom from findWindowBottom). This is the SAME path the dots-mode debugger
+ * draws, so what you verify on debug.html is exactly what production crops to.
+ * Knows nothing about kind/label (that's title-bar TEXT — read by vision and
+ * reconciled in vertical.ts).
+ */
+export function detectWindowsPixels(f: RgbFrame): PixelWindow[] {
+  const out: PixelWindow[] = [];
+  for (const d of findDotClusters(f)) {
+    const bar = traceBar(f, d);
+    if (!bar.hasBar) continue;
+    const menuBar: Box = { x: bar.left, y: d.y - 2, w: bar.right - bar.left, h: d.h + 4 };
+    const b = findWindowBottom(f, menuBar);
+    out.push({ dots: d, left: bar.left, right: bar.right, top: d.y - 2, bottom: b.y, bottomScore: b.score });
+  }
+  return out;
+}

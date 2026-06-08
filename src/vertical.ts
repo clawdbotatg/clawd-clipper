@@ -1,6 +1,7 @@
 import { extractFrame, type StackTile } from "./ffmpeg.js";
 import { completeVision, extractJson } from "./llm.js";
 import { config } from "./config.js";
+import { detectWindowsPixels, loadFrameRGB } from "./pixels.js";
 
 // Mobile (9:16) composition — the "hard mode" the brief asked for: instead of
 // letterboxing the wide call into a tall frame, ISOLATE the on-screen windows
@@ -155,44 +156,37 @@ function wholeCrop(win: Rect, srcW: number, srcH: number, inset: number): Rect {
 
 /**
  * Crop for a CAMERA tile: the largest rect of the target cell's aspect ratio
- * (`cellAspect` = cellW/cellH) that fits the speaker's webcam, CENTRED on the
- * detected face. The catch the earlier versions hit: these webcams are small,
- * roughly-square windows, and the detected window box often bleeds past the real
- * edge into a NEIGHBOURING window — so cropping the window alone catches the
- * neighbour (binji's box grabs the app beside him; Austin's grabs binji).
+ * (`cellAspect` = cellW/cellH) that fits inside the speaker's webcam window,
+ * CENTRED on the window.
  *
- * Fix: bound the crop's horizontal "lane" by the OTHER detected windows. The
- * crop can fill this window vertically, but it can never cross into a window
- * sitting to its left or right — using the data we already have to stop the
- * bleed regardless of a loose box. Centre on the face (window centre if none).
+ * We crop within the window's OWN box. Pixel geometry (src/pixels.ts) is exact —
+ * the box IS the window — so the crop can't bleed into a neighbour. An earlier
+ * version bounded the crop by the other windows' columns to fight LOOSE vision
+ * boxes that overshot into neighbours; with precise boxes that only backfired,
+ * crushing the crop to a sliver whenever an overlapping app shared the row.
+ *
+ * We centre on the window, NOT a detected face: the only landmark left to vision
+ * was the face box, and vision is unreliable at boxes (the very reason geometry
+ * moved to pixels) — the boxes wandered off the head. In practice it doesn't
+ * matter: the crop fills the window's full height in every layout, so only the
+ * horizontal centre has any play, and webcam heads sit horizontally centred — so
+ * the window centre is both more robust than the vision guess and effectively
+ * the same crop.
  */
-function faceCrop(win: DetectedWindow, others: DetectedWindow[], cellAspect: number, srcW: number, srcH: number): Rect {
+function faceCrop(win: DetectedWindow, cellAspect: number, srcW: number, srcH: number): Rect {
   const wx = win.x * srcW;
   const wy = win.y * srcH;
   const ww = win.w * srcW;
   const wh = win.h * srcH;
-  const fcx = win.face ? (win.face.x + win.face.w / 2) * srcW : wx + ww / 2;
-  const fcy = win.face ? (win.face.y + win.face.h / 2) * srcH : wy + wh / 2;
+  const fcx = wx + ww / 2;
+  const fcy = wy + wh / 2;
 
-  // Horizontal lane around the face: start at this window's edges, then pull in
-  // to any other window that shares this row and sits left/right of the face.
-  let xL = wx;
-  let xR = wx + ww;
-  for (const o of others) {
-    const ox = o.x * srcW;
-    const ow = o.w * srcW;
-    const oy = o.y * srcH;
-    const oh = o.h * srcH;
-    if (oy >= wy + wh || oy + oh <= wy) continue; // not in this row
-    if (ox + ow <= fcx) xL = Math.max(xL, ox + ow); // neighbour to the left
-    else if (ox >= fcx) xR = Math.min(xR, ox); // neighbour to the right
-  }
-  xL = Math.max(0, xL);
-  xR = Math.min(srcW, xR);
+  const xL = Math.max(0, wx);
+  const xR = Math.min(srcW, wx + ww);
   const yT = Math.max(0, wy);
   const yB = Math.min(srcH, wy + wh);
 
-  // Largest cell-aspect rect inside the available lane, centred on the face.
+  // Largest cell-aspect rect inside the window, centred on the face.
   const availW = Math.max(2, xR - xL);
   const availH = Math.max(2, yB - yT);
   let ch = availH;
@@ -207,11 +201,72 @@ function faceCrop(win: DetectedWindow, others: DetectedWindow[], cellAspect: num
 }
 
 /**
- * Detect the desktop windows in a clip's mid-frame (one vision call). Returns
- * fractional-coordinate windows; tolerant — malformed/out-of-range/sliver
- * entries are dropped, and any error (frame grab / vision) returns [] so the
- * caller falls back to blur-pad. Cache the result (windows.json) — re-deriving
- * the layout from it is free.
+ * Vision pass (one call): read each window's SEMANTICS off its title bar/name
+ * card — kind (camera/screen/app), handle/ENS label, and the face box for
+ * cameras. Vision is reliable at reading this text but loose at boxes, so we
+ * also derive a rough box here ONLY as a fallback for windows the pixel pass
+ * misses; normally the precise geometry comes from pixels (see
+ * detectClipWindows). Tolerant — bad entries dropped, any error → [].
+ */
+async function visionWindows(framePath: string, log: (m: string) => void): Promise<DetectedWindow[]> {
+  const raw = await completeVision(DETECT_PROMPT, framePath, config.anthropicModel);
+  const lo = raw.indexOf("[");
+  const hi = raw.lastIndexOf("]");
+  const json = lo >= 0 && hi > lo ? raw.slice(lo, hi + 1) : raw;
+  type RawRect = { x?: number; y?: number; w?: number; h?: number };
+  type RawWin = RawRect & { kind?: string; label?: string; face?: RawRect; dots?: RawRect; titleBar?: RawRect; nameCard?: RawRect };
+  const arr = extractJson<RawWin[]>(json);
+  if (!Array.isArray(arr)) return [];
+  const toRect = (r: RawRect | undefined): Rect | undefined => {
+    if (!r || ![r.x, r.y, r.w, r.h].every(n => typeof n === "number" && Number.isFinite(n))) return undefined;
+    if (r.w! <= 0 || r.h! <= 0 || r.x! < 0 || r.y! < 0 || r.x! + r.w! > 1.04 || r.y! + r.h! > 1.04) return undefined;
+    return { x: r.x!, y: r.y!, w: r.w!, h: r.h! };
+  };
+
+  const wins: DetectedWindow[] = [];
+  for (const o of arr) {
+    const kind: WinKind = o.kind === "screen" ? "screen" : o.kind === "app" ? "app" : "camera";
+    const titleBar = toRect(o.titleBar);
+    const dots = toRect(o.dots);
+    const nameCard = toRect(o.nameCard);
+    const face = kind === "camera" ? toRect(o.face) : undefined;
+    const obox = toRect(o);
+
+    // Rough fallback box (used only if pixels miss this window): landmarks for a
+    // camera, else the model's own box.
+    let box: Rect | undefined;
+    if (kind === "camera" && titleBar) {
+      const top = titleBar.y + titleBar.h;
+      let bottom: number;
+      if (nameCard) bottom = nameCard.y + nameCard.h;
+      else if (obox) bottom = obox.y + obox.h;
+      else if (face) bottom = face.y + face.h + face.h * 0.7;
+      else bottom = top + titleBar.w;
+      if (bottom > top) box = { x: titleBar.x, y: top, w: titleBar.w, h: bottom - top };
+    }
+    if (!box && obox) box = obox;
+    if (!box && titleBar) box = { x: titleBar.x, y: titleBar.y, w: titleBar.w, h: titleBar.h * 6 };
+    if (!box || box.w < 0.05 || box.h < 0.05) continue;
+
+    wins.push({ kind, label: typeof o.label === "string" ? o.label : "", ...box, face, dots, titleBar, nameCard });
+  }
+  return wins;
+}
+
+/**
+ * Detect the desktop windows in a clip's mid-frame — HYBRID:
+ *   • GEOMETRY is deterministic, from the pixel pipeline (src/pixels.ts): exact
+ *     window boxes off the red/yellow/green dots + title bar + bottom trace. This
+ *     is the part that was unreliable from vision and is now rock-solid.
+ *   • SEMANTICS (kind/label/face) come from one vision pass — title-bar TEXT,
+ *     which pixels can't read but vision reads well.
+ * We reconcile by matching each pixel window to the nearest vision label by DOTS
+ * position; the pixel box wins, vision supplies kind/handle/face. A window only
+ * one side found is still kept (pixel-only → assume camera; vision-only → its
+ * rough box) so we never drop a tile. Any hard failure → [] (caller blur-pads).
+ *
+ * This is the FALLBACK path for episodes with no upstream geometry log; when a
+ * geometry log lands it will supply the boxes instead and this stays the backup.
  */
 export async function detectClipWindows(opts: {
   source: string;
@@ -225,49 +280,73 @@ export async function detectClipWindows(opts: {
   try {
     const mid = (opts.startSec + opts.endSec) / 2;
     if (!opts.reuseFrame) await extractFrame(opts.source, mid, opts.framePath);
-    const raw = await completeVision(DETECT_PROMPT, opts.framePath, config.anthropicModel);
-    const lo = raw.indexOf("[");
-    const hi = raw.lastIndexOf("]");
-    const json = lo >= 0 && hi > lo ? raw.slice(lo, hi + 1) : raw;
-    type RawRect = { x?: number; y?: number; w?: number; h?: number };
-    type RawWin = RawRect & { kind?: string; label?: string; face?: RawRect; dots?: RawRect; titleBar?: RawRect; nameCard?: RawRect };
-    const arr = extractJson<RawWin[]>(json);
-    if (!Array.isArray(arr)) return [];
-    const toRect = (r: RawRect | undefined): Rect | undefined => {
-      if (!r || ![r.x, r.y, r.w, r.h].every(n => typeof n === "number" && Number.isFinite(n))) return undefined;
-      if (r.w! <= 0 || r.h! <= 0 || r.x! < 0 || r.y! < 0 || r.x! + r.w! > 1.04 || r.y! + r.h! > 1.04) return undefined;
-      return { x: r.x!, y: r.y!, w: r.w!, h: r.h! };
-    };
 
-    const wins: DetectedWindow[] = [];
-    for (const o of arr) {
-      const kind: WinKind = o.kind === "screen" ? "screen" : o.kind === "app" ? "app" : "camera";
-      const titleBar = toRect(o.titleBar);
-      const dots = toRect(o.dots);
-      const nameCard = toRect(o.nameCard);
-      const face = kind === "camera" ? toRect(o.face) : undefined;
-      const obox = toRect(o);
+    // 1) Deterministic geometry from pixels.
+    const frame = await loadFrameRGB(opts.framePath);
+    const { width: W, height: H } = frame;
+    const pixelWins = detectWindowsPixels(frame).filter(p => p.bottom > p.top);
 
-      // Derive the content box. Cameras: from the landmarks — left/width/top from
-      // the title bar, bottom from the name card; fall back to the model's own
-      // box or face when a landmark is missing. Screens/apps: the given box.
-      let box: Rect | undefined;
-      if (kind === "camera" && titleBar) {
-        const top = titleBar.y + titleBar.h; // content starts below the menu bar
-        let bottom: number;
-        if (nameCard) bottom = nameCard.y + nameCard.h;
-        else if (obox) bottom = obox.y + obox.h;
-        else if (face) bottom = face.y + face.h + face.h * 0.7;
-        else bottom = top + titleBar.w; // square-ish guess
-        if (bottom > top) box = { x: titleBar.x, y: top, w: titleBar.w, h: bottom - top };
-      }
-      if (!box && obox) box = obox;
-      if (!box && titleBar) box = { x: titleBar.x, y: titleBar.y, w: titleBar.w, h: titleBar.h * 6 };
-      if (!box || box.w < 0.05 || box.h < 0.05) continue; // missing or sliver — not a usable window
-
-      wins.push({ kind, label: typeof o.label === "string" ? o.label : "", ...box, face, dots, titleBar, nameCard });
+    // 2) Semantics from vision (best-effort; an error here just leaves labels blank).
+    let vision: DetectedWindow[] = [];
+    try {
+      vision = await visionWindows(opts.framePath, log);
+    } catch (err) {
+      log(`vision labels failed, geometry-only (${err instanceof Error ? err.message : err})`);
     }
-    return wins;
+
+    // 3) Reconcile: globally match pixel↔vision by the window's TOP-LEFT corner
+    //    (where the dots / title bar sit), nearest pairs first, each used once.
+    //    We anchor on top-left, NOT box centre, because vision only returns dots
+    //    for cameras — an app/screen's box centre sits far below its title bar,
+    //    so a centre match would never pair them. Pixel box always wins.
+    const pAnchor = (p: (typeof pixelWins)[number]) => ({ x: p.dots.x, y: p.dots.y }); // already px
+    const vAnchor = (v: DetectedWindow) => {
+      const a = v.dots ?? v.titleBar ?? { x: v.x, y: v.y };
+      return { x: a.x * W, y: a.y * H };
+    };
+    const pairs: { pi: number; vi: number; d: number }[] = [];
+    pixelWins.forEach((p, pi) => {
+      const pa = pAnchor(p);
+      vision.forEach((v, vi) => {
+        const va = vAnchor(v);
+        pairs.push({ pi, vi, d: Math.hypot(va.x - pa.x, va.y - pa.y) });
+      });
+    });
+    pairs.sort((a, b) => a.d - b.d);
+    const tol = Math.max(W, H) * 0.05; // ~96px on 1920 — dots of distinct windows sit far apart
+    const matchOf = new Map<number, number>();
+    const pUsed = new Set<number>();
+    const vUsed = new Set<number>();
+    for (const { pi, vi, d } of pairs) {
+      if (pUsed.has(pi) || vUsed.has(vi) || d > tol) continue;
+      pUsed.add(pi);
+      vUsed.add(vi);
+      matchOf.set(pi, vi);
+    }
+
+    const out: DetectedWindow[] = [];
+    pixelWins.forEach((p, pi) => {
+      const v = matchOf.has(pi) ? vision[matchOf.get(pi)!] : undefined;
+      out.push({
+        kind: v?.kind ?? "camera", // pixel-only window: cameras are the common case
+        label: v?.label ?? "",
+        x: p.left / W,
+        y: p.top / H,
+        w: (p.right - p.left) / W,
+        h: (p.bottom - p.top) / H,
+        dots: { x: p.dots.x / W, y: p.dots.y / H, w: p.dots.w / W, h: p.dots.h / H },
+        titleBar: { x: p.left / W, y: p.top / H, w: (p.right - p.left) / W, h: (p.dots.h + 4) / H },
+        // face intentionally omitted — vision's face box is unreliable and unused
+        // (faceCrop centres on the window). Kept off so debug stops drawing it.
+      });
+    });
+    // GROUND TRUTH: a window EXISTS only if its red/yellow/green dots were found
+    // by pixels. We never promote a vision-only window — vision's box is
+    // unreliable (it once hallucinated a wide window over empty desktop, which
+    // then became a crop tile). Vision LABELS pixel windows; it never creates one.
+    const visionOnly = vision.length - vUsed.size;
+    log(`${out.length} windows (${matchOf.size} labelled, ${pixelWins.length - matchOf.size} pixel-only)${visionOnly ? `, dropped ${visionOnly} vision-only (no dots)` : ""}`);
+    return out;
   } catch (err) {
     log(`window detection failed (${err instanceof Error ? err.message : err})`);
     return [];
@@ -308,13 +387,7 @@ export function composeLayout(
   // A camera tile is cropped to its cell's exact aspect (1080 × weight·1920),
   // centred on the face. Screens take the whole window, letterboxed.
   const camTile = (w: DetectedWindow, weight: number): StackTile => ({
-    ...faceCrop(
-      w,
-      wins.filter(o => o !== w),
-      OUT_W / (weight * OUT_H),
-      srcW,
-      srcH,
-    ),
+    ...faceCrop(w, OUT_W / (weight * OUT_H), srcW, srcH),
     weight,
     fit: "cover",
   });
