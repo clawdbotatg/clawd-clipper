@@ -18,7 +18,7 @@ import {
   speakerSpans,
   type LiveLine,
 } from "./speakers.js";
-import { composeLayout, detectClipWindows, type ClipLayout, type DetectedWindow } from "./vertical.js";
+import { composeLayout, detectClipWindows, layoutsSimilar, type ClipLayout, type DetectedWindow } from "./vertical.js";
 import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
 import { publishClips } from "./publish.js";
@@ -250,6 +250,7 @@ async function main() {
   // expensive part). The layout is then COMPOSED from the cached windows + the
   // clip's attributed speakers on every run (a pure function — free to retune).
   let layouts: Record<string, ClipLayout> = {};
+  let altLayouts: Record<string, ClipLayout> = {};
   if (args.vertical && resolvedCands.length) {
     log(`\n▸ detecting windows (9:16 mobile)…`);
     const windowsPath = join(outDir, "windows.json");
@@ -325,6 +326,44 @@ async function main() {
       layouts[key] = layout;
       log(`  ${c.title.slice(0, 36)} — ${layout.kind}${layout.speakers.length ? ` (${layout.speakers.join(" / ")})` : ""}`);
     }
+
+    // ── ALT 9:16 layouts — a second, deliberately-different take ──────────────
+    // Primary source is the GEOMETRY-log detector (calibrated): it often frames
+    // different windows than the pixel default. When geometry is absent (older
+    // episode) or lands on the SAME picks, fall back to an alternate COMPOSITION
+    // of the windows (swap the two-up speakers, show the screen full instead of
+    // an interview, …) via composeLayout({alt:true}) so the ALT is always a
+    // genuinely different read. Doubles the vertical render (opt-in downstream as
+    // the admin "ALT 9:16" button).
+    let altGeom: GeometryLog | null = null;
+    if (ep.manifest.geometry?.cid) {
+      try {
+        altGeom = await fetchGeometryLog(ep.manifest.geometry.cid);
+      } catch (err) {
+        log(`  alt: geometry log fetch failed, using alt-config of pixel windows (${err instanceof Error ? err.message : err})`);
+      }
+    }
+    const altOffsetMs = alignOffsetMs ?? altGeom?.videoStartMs ?? null;
+    const altNames = namesFromParticipants(ep.manifest.participants);
+    let altGeomCount = 0;
+    let altMixedCount = 0;
+    for (const c of resolvedCands) {
+      const key = clipKey(c);
+      const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
+      const geomWins = altGeom && altOffsetMs != null ? windowsAt(altGeom, ((c.start + c.end) / 2) * 1000 + altOffsetMs, altNames) : [];
+      let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height) : null;
+      const def = layouts[key];
+      if (!alt || (def && layoutsSimilar(alt, def))) {
+        // Geometry matched the default (or wasn't available) → mix it up.
+        const src = geomWins.length ? geomWins : windows[key] ?? [];
+        alt = composeLayout(src, speakers, size.width, size.height, { alt: true });
+        altMixedCount++;
+      } else {
+        altGeomCount++;
+      }
+      altLayouts[key] = alt;
+    }
+    log(`  ALT 9:16: ${altGeomCount} from geometry picks, ${altMixedCount} mixed-up (geometry matched default or absent)`);
   }
 
   // Mobile (--vertical): render the slop-desktop background once (cached), to sit
@@ -347,6 +386,7 @@ async function main() {
     burn: args.burn,
     vertical: args.vertical,
     layouts,
+    altLayouts,
     mobileBg,
     limit: args.limit,
     log: m => log(`  ${m}`),

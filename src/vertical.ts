@@ -377,6 +377,7 @@ export function composeLayout(
   speakers: string[],
   srcW: number,
   srcH: number,
+  opts?: { alt?: boolean },
 ): ClipLayout {
   const blur: ClipLayout = { tiles: null, seamFrac: 0.85, kind: "blur-pad", speakers };
   if (!wins.length) return blur;
@@ -404,21 +405,48 @@ export function composeLayout(
   // seamFrac is the caption position. Tiles are composited into the video area
   // (below the title bar, padded top/bottom), so the seam BETWEEN tiles maps from
   // a within-area fraction to a full-frame fraction via mobileSeamFrac.
+  type B = () => ClipLayout | null;
   // Speaker camera over a shared screen — slop's "interview" layout.
-  if (content && primaryCam) {
-    return { tiles: [camTile(primaryCam, 0.42), screenTile(content, 0.58)], seamFrac: mobileSeamFrac(0.42), kind: "interview", speakers };
-  }
+  const interview: B = () =>
+    content && primaryCam ? { tiles: [camTile(primaryCam, 0.42), screenTile(content, 0.58)], seamFrac: mobileSeamFrac(0.42), kind: "interview", speakers } : null;
   // Two speakers, no screen — stack their cameras 50/50.
-  if (primaryCam && secondCam) {
-    return { tiles: [camTile(primaryCam, 0.5), camTile(secondCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers };
-  }
-  // One camera — fill the video area, caption low so it stays off the face.
-  if (primaryCam) {
-    return { tiles: [camTile(primaryCam, 1)], seamFrac: mobileSeamFrac(0.85), kind: "solo", speakers };
-  }
-  // No camera but a real screen — show it full.
-  if (content) {
-    return { tiles: [screenTile(content, 1)], seamFrac: mobileSeamFrac(0.85), kind: "screen", speakers };
+  const twoUp: B = () =>
+    primaryCam && secondCam ? { tiles: [camTile(primaryCam, 0.5), camTile(secondCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers } : null;
+  // ALT take of two-up: swap which speaker is on top (a genuinely different read).
+  const twoUpSwapped: B = () =>
+    primaryCam && secondCam ? { tiles: [camTile(secondCam, 0.5), camTile(primaryCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers } : null;
+  const solo = (cam: DetectedWindow | null): B => () => (cam ? { tiles: [camTile(cam, 1)], seamFrac: mobileSeamFrac(0.85), kind: "solo", speakers } : null);
+  const screenFull: B = () => (content ? { tiles: [screenTile(content, 1)], seamFrac: mobileSeamFrac(0.85), kind: "screen", speakers } : null);
+
+  // DEFAULT order: best single composition. ALT order: deliberately reach for a
+  // DIFFERENT composition than the default (drop the screen for two cams, swap
+  // the two-up speakers, show the screen full instead of an interview, …) so the
+  // ALT 9:16 take reads differently even when both detectors found the same
+  // windows. Falls through to the same pick only when there's no other option.
+  const order: B[] = opts?.alt
+    ? [twoUpSwapped, screenFull, solo(secondCam), interview, solo(primaryCam)]
+    : [interview, twoUp, solo(primaryCam), screenFull];
+  for (const f of order) {
+    const l = f();
+    if (l) return l;
   }
   return blur;
+}
+
+/** Two layouts are "the same take" if they're the same kind with tiles in
+ *  essentially the same place (IoU ≥ 0.8 per tile). Used to decide whether the
+ *  ALT 9:16 needs to be mixed up (see src/index.ts). */
+export function layoutsSimilar(a: ClipLayout, b: ClipLayout): boolean {
+  if (a.kind !== b.kind) return false;
+  const ta = a.tiles ?? [];
+  const tb = b.tiles ?? [];
+  if (ta.length !== tb.length) return false;
+  const iou = (p: StackTile, q: StackTile) => {
+    const ix = Math.max(0, Math.min(p.x + p.w, q.x + q.w) - Math.max(p.x, q.x));
+    const iy = Math.max(0, Math.min(p.y + p.h, q.y + q.h) - Math.max(p.y, q.y));
+    const inter = ix * iy;
+    const uni = p.w * p.h + q.w * q.h - inter;
+    return uni > 0 ? inter / uni : 0;
+  };
+  return ta.every((t, i) => iou(t, tb[i]!) >= 0.8);
 }

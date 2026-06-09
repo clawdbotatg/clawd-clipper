@@ -51,6 +51,7 @@ export type Clip = ResolvedClip & {
   file: string; // mp4 filename (relative to clips dir)
   srt: string; // srt filename
   mobileFile?: string; // 9:16 mobile mp4 (relative to clips dir), when --vertical
+  altMobileFile?: string; // ALT 9:16 mobile mp4 (geometry/alt-config take), when --vertical
 };
 
 const slugify = (s: string) =>
@@ -273,6 +274,7 @@ export async function buildClips(opts: {
   burn?: boolean; // burn karaoke captions into the video
   vertical?: boolean; // render 9:16 mobile clips (stacked speaker tiles)
   layouts?: Record<string, ClipLayout>; // per-clip crop boxes (clipKey -> layout), for vertical
+  altLayouts?: Record<string, ClipLayout>; // ALT 9:16 layouts (geometry/alt-config take); doubles vertical render
   mobileBg?: string; // slop-desktop background PNG composited behind the tiles (vertical)
   limit?: number;
   log?: (m: string) => void;
@@ -360,8 +362,33 @@ export async function buildClips(opts: {
       });
     }
 
+    // ALT 9:16 (--vertical, when an alt layout is supplied): a SECOND mobile cut
+    // into <base>.alt.mobile.mp4 — the geometry-detector / alt-config take. This
+    // is the "double the effort, double the size" pass; it shares the caption ASS
+    // shape but on the alt layout's seam.
+    let altMobileFile: string | undefined;
+    if (vertical && opts.altLayouts) {
+      const altLayout = opts.altLayouts[clipKey(c)];
+      if (altLayout) {
+        altMobileFile = `${base}.alt.mobile.mp4`;
+        const altAssName = `${base}.alt.mobile.ass`;
+        if (burnBin)
+          await writeFile(
+            join(opts.clipsDir, altAssName),
+            buildAss(tokens, c.start, 1080, 1920, { vertical: true, seamFrac: altLayout.seamFrac, speakerSpans: c.speakerSpans }),
+          );
+        await cutClipVertical(opts.source, join(opts.clipsDir, altMobileFile), c.start, c.end, {
+          tiles: altLayout.tiles ?? null,
+          assFile: burnBin ? altAssName : undefined,
+          bin: burnBin ?? undefined,
+          cwd: opts.clipsDir,
+          bgPath: opts.mobileBg,
+        });
+      }
+    }
+
     await writeFile(join(opts.clipsDir, srt), buildSrt(tokens, c.start));
-    clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile });
+    clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile, altMobileFile });
   }
   return clips;
 }
