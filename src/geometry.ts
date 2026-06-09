@@ -20,15 +20,21 @@ import type { DetectedWindow, WinKind } from "./vertical.js";
 //
 //  • SPACE — slot rects are in the slop desktop LAYOUT coord space (CSS px of the
 //    shared-desktop canvas). OBS captures that canvas into the recorded frame.
-//    We map layout px → frame fraction with one affine transform. For a 1:1
-//    capture at 1920×1080 it's identity. THIS IS THE ONE CALIBRATION the design
-//    leaves open: the relay can't know the capture viewport, so if a real run
-//    shows the capture is scaled/cropped, tune the four constants below (all
-//    env-overridable) — no other code changes.
+//    We map layout px → frame fraction with one affine transform.
+//
+//    CALIBRATED 2026-06-08 on `clawdbotatg`: the recorded frame is 1920×1080 but
+//    the layout space is ~1717×960 (the broadcast viewport the relay lays out in
+//    is smaller than the OBS canvas, so the capture is scaled ~1.12×, not 1:1).
+//    Fit from 29 matched geometry↔pixel window pairs across 12 clips — scale
+//    X=1.118, Y=1.125, offset ≈0, sd ≈0.01 — i.e. a single global affine, dead
+//    consistent. With these defaults `yarn compare clawdbotatg` reports mean
+//    IoU 0.97 (was 0.50 at identity 1920×1080). If the OBS/broadcast capture
+//    setup changes, re-fit with `yarn compare <slug>` and update these four (all
+//    env-overridable: CLIPPER_GEOM_LAYOUT_W/H, CLIPPER_GEOM_OFFSET_X/Y).
 
-const LAYOUT_W = Number(process.env.CLIPPER_GEOM_LAYOUT_W) || 1920;
-const LAYOUT_H = Number(process.env.CLIPPER_GEOM_LAYOUT_H) || 1080;
-const OFFSET_X = Number(process.env.CLIPPER_GEOM_OFFSET_X) || 0; // layout px subtracted before scaling
+const LAYOUT_W = Number(process.env.CLIPPER_GEOM_LAYOUT_W) || 1717;
+const LAYOUT_H = Number(process.env.CLIPPER_GEOM_LAYOUT_H) || 960;
+const OFFSET_X = Number(process.env.CLIPPER_GEOM_OFFSET_X) || -8; // layout px subtracted before scaling
 const OFFSET_Y = Number(process.env.CLIPPER_GEOM_OFFSET_Y) || 0;
 
 type GeomEvent = {
