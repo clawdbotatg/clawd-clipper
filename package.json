@@ -10,6 +10,7 @@
   },
   "scripts": {
     "clip": "tsx src/index.ts",
+    "compare": "tsx src/compare.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
