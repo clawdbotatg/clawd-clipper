@@ -178,8 +178,16 @@ function faceCrop(win: DetectedWindow, cellAspect: number, srcW: number, srcH: n
   const wy = win.y * srcH;
   const ww = win.w * srcW;
   const wh = win.h * srcH;
+
+  // The title bar (× − +, handle text) sits at the TOP of the window — chrome,
+  // no face. Centre the crop on the VIDEO region below it, not the whole window:
+  // window-centre is biased upward by the bar, which crops the face too high
+  // (the very "it should centre up/down too" bug). titleBar height is known from
+  // the pixel pass; geometry windows carry no landmark, so assume the slop bar's
+  // ~fixed height (~3% of frame). Horizontal centre is unchanged (window centre).
+  const tbH = win.titleBar ? win.titleBar.h * srcH : Math.min(wh * 0.12, srcH * 0.03);
   const fcx = wx + ww / 2;
-  const fcy = wy + wh / 2;
+  const fcy = wy + tbH + (wh - tbH) / 2; // centre of the video region, not the window
 
   const xL = Math.max(0, wx);
   const xR = Math.min(srcW, wx + ww);
