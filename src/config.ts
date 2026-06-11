@@ -44,6 +44,10 @@ export const config = {
   // Per-clip tweet/post copy (tweets.ts). Defaults to the selection model.
   tweetsModel: env("CLIPPER_TWEETS_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
 
+  // 9:16 shot director (director.ts): which window the conversation is ABOUT,
+  // per clip. Text-only ranking over labels — fine on a cheaper model.
+  directorModel: env("CLIPPER_DIRECTOR_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+
   // ffmpeg binaries. The everyday ops (probe / audio extract / plain cut) use
   // the system `ffmpeg`. Burning styled captions needs libass, which the slim
   // homebrew `ffmpeg` lacks — so the burn pass uses the keg-only `ffmpeg-full`

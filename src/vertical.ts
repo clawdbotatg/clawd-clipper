@@ -128,14 +128,16 @@ const even = (n: number) => {
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
+/** Fuzzy label equality: normalized exact or substring either way. */
+function labelsMatch(a: string, b: string): boolean {
+  const na = norm(a);
+  const nb = norm(b);
+  return !!na && !!nb && (na === nb || na.includes(nb) || nb.includes(na));
+}
+
 /** Best camera window for a speaker handle by fuzzy label match, or null. */
 function matchCamera(cams: DetectedWindow[], speaker: string): DetectedWindow | null {
-  const ns = norm(speaker);
-  if (!ns) return null;
-  for (const c of cams) {
-    const nl = norm(c.label);
-    if (nl && (nl === ns || nl.includes(ns) || ns.includes(nl))) return c;
-  }
+  for (const c of cams) if (labelsMatch(c.label, speaker)) return c;
   return null;
 }
 
@@ -365,11 +367,39 @@ const SCREEN_INSET = 0.015;
 const OUT_W = 1080;
 const OUT_H = 1920;
 
+/** Dominant-speaker share (% of spoken chars) at or above which we treat the
+ *  attribution as SURE — sure enough to pin that speaker to the ALT's top tile. */
+const SURE_PCT = 70;
+
+export type ComposeOpts = {
+  alt?: boolean;
+  /** Director's ordered labels of the windows the conversation is ABOUT
+   *  (director.ts). [] = pure conversation → prefer cameras over an incidental
+   *  screen share. undefined = no director ruling → legacy screen heuristic. */
+  feature?: string[];
+  /** Dominant speaker's share of spoken chars (0-100), for the SURE gate. */
+  primaryPct?: number;
+};
+
 /**
  * Compose a clip's 9:16 layout from its detected windows + top speakers — a pure
- * function (no IO), mirroring slop's MobileStage. Hero content is a real SCREEN
- * share ONLY; apps (CHAT/QR/TRANSCRIPT/…) are deliberately NOT treated as hero —
- * pairing a face over the live-transcript window just fights our own captions.
+ * function (no IO), mirroring slop's MobileStage.
+ *
+ * The bottom "content" tile is chosen by RELEVANCE, not kind: the director pass
+ * (director.ts) ranks the windows the dialog is actually about, so an app
+ * (CHESS mid-match, the BROWSER page being read aloud) can earn the tile — but
+ * ONLY by being talked about; without a director ruling, apps never qualify and
+ * the first real SCREEN share is used, as before. TRANSCRIPT never qualifies
+ * (it fights our own burned captions). When the director says the clip is pure
+ * conversation ([]), cameras win over an incidental screen share.
+ *
+ * ALT take: when we're SURE who's speaking (dominant share ≥ SURE_PCT and their
+ * camera matched by label), the speaker KEEPS the top tile and only the bottom
+ * window changes — next-most-relevant content, or the other camera. Only when
+ * attribution is shaky does the ALT swap speakers / go screen-full, hedging a
+ * wrong default. Either way the ALT is checked against the default and the
+ * first genuinely different composition wins.
+ *
  * Returns null tiles (→ blur-pad) when nothing usable resolves.
  */
 export function composeLayout(
@@ -377,13 +407,25 @@ export function composeLayout(
   speakers: string[],
   srcW: number,
   srcH: number,
-  opts?: { alt?: boolean },
+  opts?: ComposeOpts,
 ): ClipLayout {
   const blur: ClipLayout = { tiles: null, seamFrac: 0.85, kind: "blur-pad", speakers };
   if (!wins.length) return blur;
 
   const cams = wins.filter(w => w.kind === "camera");
-  const content = wins.find(w => w.kind === "screen") ?? null; // real screen shares only
+  // Content candidates for the bottom tile. TRANSCRIPT is hard-excluded.
+  const contentWins = wins.filter(w => w.kind !== "camera" && !norm(w.label).includes("transcript"));
+
+  // Rank content: director picks first (in their order), then real screen
+  // shares. Apps appear ONLY via a director pick.
+  const ranked: DetectedWindow[] = [];
+  for (const f of opts?.feature ?? []) {
+    const m = contentWins.find(w => !ranked.includes(w) && labelsMatch(w.label, f));
+    if (m) ranked.push(m);
+  }
+  for (const w of contentWins) if (w.kind === "screen" && !ranked.includes(w)) ranked.push(w);
+  const content = ranked[0] ?? null;
+  const content2 = ranked[1] ?? null;
 
   const matched: DetectedWindow[] = [];
   for (const sp of speakers) {
@@ -393,8 +435,12 @@ export function composeLayout(
   const primaryCam = matched[0] ?? cams[0] ?? null;
   const secondCam = matched[1] ?? cams.find(c => c !== primaryCam) ?? null;
 
+  // SURE = the dominant speaker owns the clip AND we found their camera by
+  // label (not the cams[0] fallback). Gates the speaker-pinned ALT below.
+  const sure = matched.length > 0 && (opts?.primaryPct ?? 0) >= SURE_PCT;
+
   // A camera tile is cropped to its cell's exact aspect (1080 × weight·1920),
-  // centred on the face. Screens take the whole window, letterboxed.
+  // centred on the face. Screens/apps take the whole window, letterboxed.
   const camTile = (w: DetectedWindow, weight: number): StackTile => ({
     ...faceCrop(w, OUT_W / (weight * OUT_H), srcW, srcH),
     weight,
@@ -406,31 +452,46 @@ export function composeLayout(
   // (below the title bar, padded top/bottom), so the seam BETWEEN tiles maps from
   // a within-area fraction to a full-frame fraction via mobileSeamFrac.
   type B = () => ClipLayout | null;
-  // Speaker camera over a shared screen — slop's "interview" layout.
-  const interview: B = () =>
-    content && primaryCam ? { tiles: [camTile(primaryCam, 0.42), screenTile(content, 0.58)], seamFrac: mobileSeamFrac(0.42), kind: "interview", speakers } : null;
-  // Two speakers, no screen — stack their cameras 50/50.
+  // Speaker camera over a content window — slop's "interview" layout.
+  const interviewWith = (c: DetectedWindow | null): B => () =>
+    c && primaryCam ? { tiles: [camTile(primaryCam, 0.42), screenTile(c, 0.58)], seamFrac: mobileSeamFrac(0.42), kind: "interview", speakers } : null;
+  // Two speakers — stack their cameras 50/50, dominant speaker on top.
   const twoUp: B = () =>
     primaryCam && secondCam ? { tiles: [camTile(primaryCam, 0.5), camTile(secondCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers } : null;
-  // ALT take of two-up: swap which speaker is on top (a genuinely different read).
+  // Swapped two-up: the other speaker on top (a genuinely different read).
   const twoUpSwapped: B = () =>
     primaryCam && secondCam ? { tiles: [camTile(secondCam, 0.5), camTile(primaryCam, 0.5)], seamFrac: mobileSeamFrac(0.5), kind: "two-up", speakers } : null;
   const solo = (cam: DetectedWindow | null): B => () => (cam ? { tiles: [camTile(cam, 1)], seamFrac: mobileSeamFrac(0.85), kind: "solo", speakers } : null);
   const screenFull: B = () => (content ? { tiles: [screenTile(content, 1)], seamFrac: mobileSeamFrac(0.85), kind: "screen", speakers } : null);
 
-  // DEFAULT order: best single composition. ALT order: deliberately reach for a
-  // DIFFERENT composition than the default (drop the screen for two cams, swap
-  // the two-up speakers, show the screen full instead of an interview, …) so the
-  // ALT 9:16 take reads differently even when both detectors found the same
-  // windows. Falls through to the same pick only when there's no other option.
-  const order: B[] = opts?.alt
-    ? [twoUpSwapped, screenFull, solo(secondCam), interview, solo(primaryCam)]
-    : [interview, twoUp, solo(primaryCam), screenFull];
-  for (const f of order) {
-    const l = f();
-    if (l) return l;
-  }
-  return blur;
+  // First composition in `order` that resolves and isn't `avoid` (same take).
+  const pick = (order: B[], avoid?: ClipLayout | null): ClipLayout | null => {
+    for (const f of order) {
+      const l = f();
+      if (!l) continue;
+      if (avoid && layoutsSimilar(l, avoid)) continue;
+      return l;
+    }
+    return null;
+  };
+
+  // DEFAULT: pure conversation (director ruled []) → cameras before content;
+  // otherwise lead with the most relevant content window under the speaker.
+  const pureTalk = opts?.feature != null && opts.feature.length === 0;
+  const defaultOrder: B[] = pureTalk
+    ? [twoUp, interviewWith(content), solo(primaryCam), screenFull]
+    : [interviewWith(content), twoUp, solo(primaryCam), screenFull];
+
+  if (!opts?.alt) return pick(defaultOrder) ?? blur;
+
+  // ALT: a deliberately different second take on the SAME windows.
+  const def = pick(defaultOrder) ?? blur;
+  const altOrder: B[] = sure
+    ? // Speaker confirmed → keep them on top, vary only the bottom tile.
+      [interviewWith(content2), twoUp, interviewWith(content), solo(primaryCam), screenFull]
+    : // Attribution shaky → hedge with a different framing entirely.
+      [twoUpSwapped, screenFull, solo(secondCam), interviewWith(content2 ?? content), solo(primaryCam)];
+  return pick(altOrder, def) ?? def;
 }
 
 /** Two layouts are "the same take" if they're the same kind with tiles in

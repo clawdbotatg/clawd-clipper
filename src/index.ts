@@ -18,7 +18,8 @@ import {
   speakerSpans,
   type LiveLine,
 } from "./speakers.js";
-import { composeLayout, detectClipWindows, layoutsSimilar, type ClipLayout, type DetectedWindow } from "./vertical.js";
+import { composeLayout, detectClipWindows, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
+import { directWindows, type Director } from "./director.js";
 import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
 import { publishClips } from "./publish.js";
@@ -263,6 +264,17 @@ async function main() {
       }
     }
     const size = await probeSize(source);
+    // OPT-IN geometry: the geometry log records the relay's interactive
+    // god-desktop slot positions, but the OBS-recorded video is a *different*
+    // composition (windows re-arranged / clamped at the broadcast viewport), so
+    // replayed rects don't line up with the recorded pixels — verified on
+    // clawdbotatg: two cameras can't be reconciled by a single affine. Until the
+    // upstream logs the BROADCAST composition's coords (not the slot coords),
+    // default to the pixel detector, which reads the actual recorded frame. Set
+    // CLIPPER_USE_GEOMETRY=1 to re-enable once that calibration is solved.
+    // (Gates BOTH the default detection below and the ALT take further down —
+    // the ALT used to consume the misaligned log unconditionally.)
+    const useGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
     const missing = resolvedCands.filter(c => !windows[clipKey(c)]);
     if (!missing.length) {
       log(`  loaded cached windows`);
@@ -272,15 +284,6 @@ async function main() {
       // offset recovered from the transcript (geometry shares its wall clock),
       // falling back to the log header's videoStartMs. CV stays the per-clip
       // fallback for anything the log can't cover (gaps, off-frame, older eps).
-      // OPT-IN: the geometry log records the relay's interactive god-desktop slot
-      // positions, but the OBS-recorded video is a *different* composition (windows
-      // re-arranged / clamped at the broadcast viewport), so replayed rects don't
-      // line up with the recorded pixels — verified on clawdbotatg: two cameras
-      // can't be reconciled by a single affine. Until the upstream logs the
-      // BROADCAST composition's coords (not the slot coords), default to the pixel
-      // detector, which reads the actual recorded frame. Set CLIPPER_USE_GEOMETRY=1
-      // to re-enable once that calibration is solved.
-      const useGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
       let geomLog: GeometryLog | null = null;
       if (useGeometry && ep.manifest.geometry?.cid) {
         try {
@@ -318,25 +321,59 @@ async function main() {
       }
       await writeFile(windowsPath, JSON.stringify(windows, null, 2));
     }
+    // ── Director pass — what is each clip ABOUT? ──────────────────────────────
+    // One batched LLM call (cached, like judge/refine/tweets): per clip, rank
+    // the detected windows the conversation actually references (a demo being
+    // narrated, the chess game under discussion, …) — or rule "pure
+    // conversation" so the composer prefers cameras over an incidental screen
+    // share. Best-effort: a failed/missing ruling leaves that clip on the old
+    // first-screen heuristic.
+    log(`\n▸ directing 9:16 content…`);
+    const directorPath = join(outDir, "director.json");
+    let director: Director = {};
+    if (!args.force) {
+      try {
+        director = JSON.parse(await readFile(directorPath, "utf8")) as Director;
+      } catch {
+        /* no cache */
+      }
+    }
+    const directorCovered = resolvedCands.every(c => director[clipKey(c)] !== undefined);
+    if (directorCovered && Object.keys(director).length) {
+      log(`  loaded cached picks`);
+    } else {
+      director = await directWindows(resolvedCands, windows, ep.manifest.meta, m => log(`  ${m}`));
+      await writeFile(directorPath, JSON.stringify(director, null, 2));
+    }
+
+    // Per-clip compose options: the director's relevance ranking + the dominant
+    // speaker's share (composeLayout's SURE gate for the speaker-pinned ALT).
+    const composeOpts = (c: (typeof resolvedCands)[number]): ComposeOpts => ({
+      feature: director[clipKey(c)],
+      primaryPct: c.speakers?.[0]?.pct,
+    });
+
     // Compose each clip's layout from its windows + attributed speakers.
     for (const c of resolvedCands) {
       const key = clipKey(c);
       const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
-      const layout = composeLayout(windows[key] ?? [], speakers, size.width, size.height);
+      const layout = composeLayout(windows[key] ?? [], speakers, size.width, size.height, composeOpts(c));
       layouts[key] = layout;
-      log(`  ${c.title.slice(0, 36)} — ${layout.kind}${layout.speakers.length ? ` (${layout.speakers.join(" / ")})` : ""}`);
+      const picks = director[key];
+      log(`  ${c.title.slice(0, 36)} — ${layout.kind}${layout.speakers.length ? ` (${layout.speakers.join(" / ")})` : ""}${picks?.length ? ` · about: ${picks.join(", ")}` : ""}`);
     }
 
     // ── ALT 9:16 layouts — a second, deliberately-different take ──────────────
-    // Primary source is the GEOMETRY-log detector (calibrated): it often frames
-    // different windows than the pixel default. When geometry is absent (older
-    // episode) or lands on the SAME picks, fall back to an alternate COMPOSITION
-    // of the windows (swap the two-up speakers, show the screen full instead of
-    // an interview, …) via composeLayout({alt:true}) so the ALT is always a
-    // genuinely different read. Doubles the vertical render (opt-in downstream as
-    // the admin "ALT 9:16" button).
+    // Composed from the SAME windows via composeLayout({alt:true}): when speaker
+    // attribution is SURE (≥70% share + camera matched) the speaker keeps the
+    // top tile and only the bottom window changes; otherwise the take swaps
+    // speakers / goes screen-full to hedge a wrong default. The geometry-log
+    // detector only feeds this when CLIPPER_USE_GEOMETRY=1 (its slot coords
+    // don't match the recorded composition — see the note above; it used to run
+    // here ungated, producing misaligned ALT crops). Doubles the vertical render
+    // (opt-in downstream as the admin "ALT 9:16" button).
     let altGeom: GeometryLog | null = null;
-    if (ep.manifest.geometry?.cid) {
+    if (useGeometry && ep.manifest.geometry?.cid) {
       try {
         altGeom = await fetchGeometryLog(ep.manifest.geometry.cid);
       } catch (err) {
@@ -351,19 +388,18 @@ async function main() {
       const key = clipKey(c);
       const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
       const geomWins = altGeom && altOffsetMs != null ? windowsAt(altGeom, ((c.start + c.end) / 2) * 1000 + altOffsetMs, altNames) : [];
-      let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height) : null;
+      let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height, composeOpts(c)) : null;
       const def = layouts[key];
       if (!alt || (def && layoutsSimilar(alt, def))) {
-        // Geometry matched the default (or wasn't available) → mix it up.
-        const src = geomWins.length ? geomWins : windows[key] ?? [];
-        alt = composeLayout(src, speakers, size.width, size.height, { alt: true });
+        // No (usable) geometry take → alternate composition of the same windows.
+        alt = composeLayout(windows[key] ?? [], speakers, size.width, size.height, { ...composeOpts(c), alt: true });
         altMixedCount++;
       } else {
         altGeomCount++;
       }
       altLayouts[key] = alt;
     }
-    log(`  ALT 9:16: ${altGeomCount} from geometry picks, ${altMixedCount} mixed-up (geometry matched default or absent)`);
+    log(`  ALT 9:16: ${altGeomCount} from geometry picks, ${altMixedCount} alt-composed (speaker pinned when attribution is sure)`);
   }
 
   // Mobile (--vertical): render the slop-desktop background once (cached), to sit
