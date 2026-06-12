@@ -324,6 +324,50 @@ async function main() {
       }
       await writeFile(windowsPath, JSON.stringify(windows, null, 2));
     }
+    // An "anonymous" identity — a relay anonId or a shortened address. Never a
+    // real handle, so never useful for matching a speaker to a name card.
+    const anonish = (s: string) => /^anon\d*$/i.test(s) || /^0x[0-9a-f]{4}…/i.test(s);
+
+    // ── Cross-clip camera label propagation ──────────────────────────────────
+    // The same camera window sits at the same desktop position all episode, but
+    // vision labels it per-clip — and per-clip it sometimes whiffs (no label) or
+    // reads a stale name card (shafu0x: the card said "anon6946" for a stretch
+    // before resolving to the ENS). Cluster cameras across clips by position and
+    // give empty/anon labels the cluster's majority label, so one good read
+    // covers the whole episode. Pure computation on the (raw) cached windows —
+    // re-derived every run, never written back to windows.json.
+    {
+      type Cluster = { cx: number; cy: number; votes: Map<string, number>; members: DetectedWindow[] };
+      const clusters: Cluster[] = [];
+      for (const wins of Object.values(windows)) {
+        for (const w of wins) {
+          if (w.kind !== "camera") continue;
+          const cx = w.x + w.w / 2;
+          const cy = w.y + w.h / 2;
+          let cl = clusters.find(c => Math.hypot(c.cx - cx, c.cy - cy) < 0.04);
+          if (!cl) {
+            cl = { cx, cy, votes: new Map(), members: [] };
+            clusters.push(cl);
+          }
+          cl.members.push(w);
+          if (w.label && !anonish(w.label)) cl.votes.set(w.label, (cl.votes.get(w.label) ?? 0) + 1);
+        }
+      }
+      let filled = 0;
+      for (const cl of clusters) {
+        const top = [...cl.votes.entries()].sort((a, b) => b[1] - a[1])[0];
+        // Trust the majority; trust a single read only when uncontested (a lone
+        // read may be wrong, but conflicting reads definitely include one).
+        if (!top || (top[1] < 2 && cl.votes.size > 1)) continue;
+        for (const w of cl.members) {
+          if (w.label && !anonish(w.label)) continue;
+          w.label = top[0];
+          filled++;
+        }
+      }
+      if (filled) log(`  propagated camera labels to ${filled} unlabeled/anon windows (by position)`);
+    }
+
     // ── Anon speaker aliasing ─────────────────────────────────────────────────
     // A guest whose live-transcript lines carry no handle/address attributes as
     // "Anon####" — a name that can never match their camera's name card, so the
@@ -333,7 +377,6 @@ async function main() {
     // the named speakers (with clear frequency dominance), they're the same
     // person — rewrite the speaker fields. Conservative: any ambiguity → skip.
     {
-      const anonish = (s: string) => /^anon\d*$/i.test(s) || /^0x[0-9a-f]{4}…/i.test(s);
       const named = new Set(liveLines.map(l => l.speaker).filter(s => !anonish(s)));
       const camLabels = new Map<string, { label: string; n: number }>();
       for (const wins of Object.values(windows))
