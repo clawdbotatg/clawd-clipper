@@ -129,7 +129,7 @@ const even = (n: number) => {
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
 /** Fuzzy label equality: normalized exact or substring either way. */
-function labelsMatch(a: string, b: string): boolean {
+export function labelsMatch(a: string, b: string): boolean {
   const na = norm(a);
   const nb = norm(b);
   return !!na && !!nb && (na === nb || na.includes(nb) || nb.includes(na));
@@ -235,7 +235,16 @@ async function visionWindows(framePath: string, log: (m: string) => void): Promi
 
   const wins: DetectedWindow[] = [];
   for (const o of arr) {
-    const kind: WinKind = o.kind === "screen" ? "screen" : o.kind === "app" ? "app" : "camera";
+    let kind: WinKind = o.kind === "screen" ? "screen" : o.kind === "app" ? "app" : "camera";
+    let label = typeof o.label === "string" ? o.label.trim() : "";
+    // Vision sometimes returns the raw TITLE text as the label with the wrong
+    // kind (shafu0x: `app:"CAMERA — CLAWDBOTATG.ETH"`). The title prefix is
+    // authoritative — coerce kind from it and keep just the handle/name.
+    const prefixed = label.match(/^(CAMERA|SCREEN)\s*[—–-]+\s*(.+)$/i);
+    if (prefixed) {
+      kind = prefixed[1]!.toLowerCase() === "camera" ? "camera" : "screen";
+      label = prefixed[2]!.trim();
+    }
     const titleBar = toRect(o.titleBar);
     const dots = toRect(o.dots);
     const nameCard = toRect(o.nameCard);
@@ -258,7 +267,7 @@ async function visionWindows(framePath: string, log: (m: string) => void): Promi
     if (!box && titleBar) box = { x: titleBar.x, y: titleBar.y, w: titleBar.w, h: titleBar.h * 6 };
     if (!box || box.w < 0.05 || box.h < 0.05) continue;
 
-    wins.push({ kind, label: typeof o.label === "string" ? o.label : "", ...box, face, dots, titleBar, nameCard });
+    wins.push({ kind, label, ...box, face, dots, titleBar, nameCard });
   }
   return wins;
 }
@@ -284,6 +293,10 @@ export async function detectClipWindows(opts: {
   startSec: number;
   endSec: number;
   reuseFrame?: boolean;
+  /** Participant handles/ENS from the manifest — used to coerce an `app`-kind
+   *  window whose label is actually a person (vision misread the kind) back to
+   *  a camera, so the composer's cam list is complete. */
+  participants?: string[];
   log?: (m: string) => void;
 }): Promise<DetectedWindow[]> {
   const log = opts.log ?? (() => {});
@@ -337,8 +350,14 @@ export async function detectClipWindows(opts: {
     const out: DetectedWindow[] = [];
     pixelWins.forEach((p, pi) => {
       const v = matchOf.has(pi) ? vision[matchOf.get(pi)!] : undefined;
+      // An "app" whose label is a participant's handle/ENS is a misread camera
+      // (vision saw the name but botched the kind — shafu0x: `app:clawdbotatg.eth`).
+      // Real screen shares keep their kind: "SCREEN — <name>" is also labelled
+      // with a person but already coerced to "screen" upstream.
+      let kind: WinKind = v?.kind ?? "camera"; // pixel-only window: cameras are the common case
+      if (kind === "app" && v?.label && (opts.participants ?? []).some(pp => labelsMatch(v.label, pp))) kind = "camera";
       out.push({
-        kind: v?.kind ?? "camera", // pixel-only window: cameras are the common case
+        kind,
         label: v?.label ?? "",
         x: p.left / W,
         y: p.top / H,

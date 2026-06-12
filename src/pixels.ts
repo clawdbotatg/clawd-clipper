@@ -48,10 +48,21 @@ export type Box = { x: number; y: number; w: number; h: number };
 // Classify a pixel as 1=red, 2=yellow, 3=green, 0=other. The magenta title bar
 // (≈212,16,166) is the main thing to exclude — it has HIGH blue, the red dot
 // has LOW blue, so the blue bounds separate them.
+//
+// Each colour also gets a DIMMED band: slop renders UNFOCUSED windows at ~72%
+// brightness, so their dots read ≈(191,69,67)/(184,135,36)/(30,142,50) and the
+// bright-only thresholds miss them entirely. That made unfocused windows
+// invisible to detection — and an undetected window below a focused one let the
+// focused window's bottom trace run straight through it (the shafu0x split-
+// screen bug). The dim bands are narrow and the red→yellow→green adjacency
+// structure (findDotClusters) filters any stray video pixels they admit.
 function classify(r: number, g: number, b: number): 0 | 1 | 2 | 3 {
   if (r > 215 && g >= 55 && g <= 140 && b >= 40 && b <= 130 && r - g > 95 && r - b > 105) return 1; // red
+  if (r > 168 && g >= 40 && g <= 110 && b >= 35 && b <= 110 && r - g > 100 && r - b > 105) return 1; // red (dimmed)
   if (r > 225 && g >= 150 && g <= 215 && b < 105 && g - b > 80 && r - b > 135) return 2; // yellow
+  if (r > 165 && g >= 110 && g < 170 && b < 80 && g - b > 75 && r - b > 125) return 2; // yellow (dimmed)
   if (r < 110 && g > 150 && b < 120 && g - r > 85 && g - b > 75) return 3; // green
+  if (r < 85 && g > 118 && b < 95 && g - r > 85 && g - b > 70) return 3; // green (dimmed)
   return 0;
 }
 
@@ -146,8 +157,12 @@ export function findDotClusters(f: RgbFrame): Box[] {
 
 // The window title/menu bar + frame magenta, sampled from real frames
 // (≈190,55,160, a gradient). Distinct from the red dot by its HIGH blue.
+// Second band: the same bar on an UNFOCUSED (dimmed ~72%) window reads
+// ≈(104,33,91) — same hue, lower brightness — which the bright band misses,
+// so the bar trace (and with it the whole window) failed for dimmed windows.
 function isMagenta(r: number, g: number, b: number): boolean {
-  return r > 150 && g < 100 && b > 115 && b - g > 35 && r - g > 70;
+  if (r > 150 && g < 100 && b > 115 && b - g > 35 && r - g > 70) return true;
+  return r > 88 && r <= 160 && g < 70 && b > 72 && r - g > 55 && b - g > 40;
 }
 
 /** Fraction of a vertical span at column `x` that is magenta. */
@@ -606,6 +621,26 @@ export function detectWindowsPixels(f: RgbFrame): PixelWindow[] {
     const menuBar: Box = { x: bar.left, y: d.y - 2, w: bar.right - bar.left, h: d.h + 4 };
     const b = findWindowBottom(f, menuBar);
     out.push({ dots: d, left: bar.left, right: bar.right, top: d.y - 2, bottom: b.y, bottomScore: b.score });
+  }
+  // OCCLUSION CLAMP. A visible title bar is ground truth that ITS window owns
+  // the pixels there — so window A's visible region can never extend past
+  // window B's top when B's bar sits below A's top inside A's span. Without
+  // this, A's side traces run straight through a window stacked below (the two
+  // windows' side frames line up, and the tracer bridges the seam), the crop
+  // swallows BOTH windows, and a "solo" tile renders as an accidental split
+  // screen with the low solo captions over the bottom window's face (the
+  // shafu0x bug). Clamping also RESCUES windows whose own bottom wasn't found
+  // (bottom -1): the occluder's top is a hard upper bound.
+  for (const a of out) {
+    for (const b of out) {
+      if (b === a) continue;
+      const ovl = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+      if (ovl < (a.right - a.left) * 0.4) continue; // barely overlapping columns — a side-by-side neighbour, not a stack
+      if (b.top < a.top + 60) continue; // same row of windows, not below
+      if (a.bottom > 0 && b.top >= a.bottom) continue; // B starts past A's (known) bottom
+      a.bottom = b.top - 2;
+      a.bottomScore = Math.max(a.bottomScore, 0.9); // structural evidence beats a faint border guess
+    }
   }
   return out;
 }

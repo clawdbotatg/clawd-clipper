@@ -18,7 +18,7 @@ import {
   speakerSpans,
   type LiveLine,
 } from "./speakers.js";
-import { composeLayout, detectClipWindows, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
+import { composeLayout, detectClipWindows, labelsMatch, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
 import { directWindows, type Director } from "./director.js";
 import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
@@ -175,10 +175,12 @@ async function main() {
   // Recovered video↔wall-clock offset, reused by the geometry-log layout below
   // (geometry events share the live transcript's wall clock).
   let alignOffsetMs: number | null = null;
+  let liveLines: LiveLine[] = []; // kept for the anon-speaker alias pass below
   if (resolvedCands.length && ep.manifest.transcript?.cid) {
     log(`\n▸ attributing speakers…`);
     const names = namesFromParticipants(ep.manifest.participants);
     const live = await fetchLiveTranscript(ep.manifest.transcript.cid, names);
+    liveLines = live;
     const align = alignToVideo(live, transcript);
     if (align.offsetMs != null) {
       alignOffsetMs = align.offsetMs;
@@ -314,6 +316,7 @@ async function main() {
             framePath: join(framesDir, `${key}.png`),
             startSec: c.start,
             endSec: c.end,
+            participants: [...new Set(Object.values(geomNames))],
             log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
           });
         }
@@ -321,6 +324,44 @@ async function main() {
       }
       await writeFile(windowsPath, JSON.stringify(windows, null, 2));
     }
+    // ── Anon speaker aliasing ─────────────────────────────────────────────────
+    // A guest whose live-transcript lines carry no handle/address attributes as
+    // "Anon####" — a name that can never match their camera's name card, so the
+    // composer doesn't know which camera is the speaker and the burned nameplate
+    // reads ANON#### (the shafu0x failure). Recover by elimination: if exactly
+    // ONE anon speaker exists and exactly one camera label is left unclaimed by
+    // the named speakers (with clear frequency dominance), they're the same
+    // person — rewrite the speaker fields. Conservative: any ambiguity → skip.
+    {
+      const anonish = (s: string) => /^anon\d*$/i.test(s) || /^0x[0-9a-f]{4}…/i.test(s);
+      const named = new Set(liveLines.map(l => l.speaker).filter(s => !anonish(s)));
+      const camLabels = new Map<string, { label: string; n: number }>();
+      for (const wins of Object.values(windows))
+        for (const w of wins) {
+          if (w.kind !== "camera" || !w.label || anonish(w.label)) continue;
+          const k = w.label.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const e = camLabels.get(k);
+          if (e) e.n++;
+          else camLabels.set(k, { label: w.label, n: 1 });
+        }
+      const unclaimed = [...camLabels.values()]
+        .filter(c => ![...named].some(s => labelsMatch(c.label, s)))
+        .sort((a, b) => b.n - a.n);
+      const anons = [...new Set(resolvedCands.flatMap(c => (c.speakers ?? []).map(s => s.speaker)).filter(anonish))];
+      if (anons.length === 1 && unclaimed.length && unclaimed[0]!.n >= 2 && (unclaimed.length === 1 || unclaimed[0]!.n >= 2 * unclaimed[1]!.n)) {
+        const from = anons[0]!;
+        const to = unclaimed[0]!.label;
+        for (const c of resolvedCands) {
+          if (c.speaker === from) c.speaker = to;
+          for (const s of c.speakers ?? []) if (s.speaker === from) s.speaker = to;
+          for (const s of c.speakerSpans ?? []) if (s.speaker === from) s.speaker = to;
+        }
+        log(`  aliased anon speaker ${from} → ${to} (the one camera no named speaker claims)`);
+      } else if (anons.length) {
+        log(`  anon speaker(s) ${anons.join(", ")} left unaliased (${unclaimed.length} unclaimed cams — ambiguous)`);
+      }
+    }
+
     // ── Director pass — what is each clip ABOUT? ──────────────────────────────
     // One batched LLM call (cached, like judge/refine/tweets): per clip, rank
     // the detected windows the conversation actually references (a demo being
