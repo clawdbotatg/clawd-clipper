@@ -14,10 +14,12 @@ import {
   alignToVideo,
   attributeWindow,
   fetchLiveTranscript,
+  labelSegments,
   namesFromParticipants,
   speakerSpans,
   type LiveLine,
 } from "./speakers.js";
+import { chatReactions, fetchChat } from "./chat.js";
 import { composeLayout, detectClipWindows, labelsMatch, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
 import { directWindows, type Director } from "./director.js";
 import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
@@ -117,6 +119,41 @@ async function main() {
     log: m => log(`  ${m}`),
   });
 
+  // Speaker + chat signal for the selector — recovered up front so the candidate
+  // model can read "who said what" and see where the live chat lit up (the two
+  // biggest signals it was previously blind to). The live transcript carries a
+  // handle per line on a wall clock; alignToVideo recovers the constant offset to
+  // the whisper (video) clock. We keep `liveLines` + `alignOffsetMs` and reuse
+  // them for per-clip speaker attribution + the geometry-log layout below. The
+  // research dossier (correctly-spelled proper nouns) is passed in by the relay
+  // via CLIPPER_RESEARCH when it spawns us; absent on standalone runs.
+  const research = process.env.CLIPPER_RESEARCH?.trim() || undefined;
+  let alignOffsetMs: number | null = null;
+  let liveLines: LiveLine[] = [];
+  if (ep.manifest.transcript?.cid) {
+    try {
+      const names = namesFromParticipants(ep.manifest.participants);
+      liveLines = await fetchLiveTranscript(ep.manifest.transcript.cid, names);
+      const align = alignToVideo(liveLines, transcript);
+      alignOffsetMs = align.offsetMs;
+      if (alignOffsetMs != null) log(`  aligned live transcript (offset ${(alignOffsetMs / 1000).toFixed(1)}s · ${align.matches} matches)`);
+      else log(`  could not align live transcript — speakers/chat signal unavailable to selector`);
+    } catch (err) {
+      log(`  live transcript unavailable (${err instanceof Error ? err.message : err})`);
+    }
+  }
+  const speakerLabels = liveLines.length && alignOffsetMs != null ? labelSegments(transcript.segments, liveLines, alignOffsetMs) : undefined;
+  let chatBlock: string | undefined;
+  if (alignOffsetMs != null && ep.manifest.chat?.cid) {
+    try {
+      const chat = await fetchChat(ep.manifest.chat.cid);
+      chatBlock = chatReactions(chat, alignOffsetMs, transcript.duration);
+      if (chatBlock) log(`  chat reactions: ${chatBlock.split("\n").length} spike windows fed to selector`);
+    } catch (err) {
+      log(`  chat unavailable (${err instanceof Error ? err.message : err})`);
+    }
+  }
+
   log(`\n▸ selecting clip candidates…`);
   // Cache the LLM's raw candidates so re-runs (tweaking padding, captions,
   // gallery) are free + deterministic. --force re-asks the model.
@@ -135,6 +172,7 @@ async function main() {
       transcript,
       meta: ep.manifest.meta,
       targetSeconds: args.target,
+      context: { speakerLabels, chatReactions: chatBlock, research },
     });
     await writeFile(candPath, JSON.stringify(candidates, null, 2));
     log(`  model proposed ${candidates.length} candidates`);
@@ -167,37 +205,24 @@ async function main() {
     log(`  judged ${resolvedCands.length} clips · ${cut} flagged "cut" · re-ranked by blended score`);
   }
 
-  // Speaker attribution: who's talking in each clip. whisper drops speakers, so
-  // we recover them from slop's live transcript (handle/address per line),
-  // aligned to the re-transcription, and tally the dominant speaker per clip
-  // window. Best-effort + no AI — no live transcript or no alignment just leaves
-  // speakers unset. Surfaced on every clip in the gallery + index.json.
-  // Recovered video↔wall-clock offset, reused by the geometry-log layout below
-  // (geometry events share the live transcript's wall clock).
-  let alignOffsetMs: number | null = null;
-  let liveLines: LiveLine[] = []; // kept for the anon-speaker alias pass below
-  if (resolvedCands.length && ep.manifest.transcript?.cid) {
+  // Per-clip speaker attribution: who's talking in each clip window. Reuses the
+  // live transcript + video↔wall-clock offset already recovered above (whisper
+  // drops speakers; the live transcript carries them). Best-effort — no alignment
+  // just leaves speakers unset. Surfaced on every clip in the gallery + index.json
+  // and drives the 9:16 layout's top tile + burned nameplate below.
+  if (resolvedCands.length && liveLines.length && alignOffsetMs != null) {
     log(`\n▸ attributing speakers…`);
-    const names = namesFromParticipants(ep.manifest.participants);
-    const live = await fetchLiveTranscript(ep.manifest.transcript.cid, names);
-    liveLines = live;
-    const align = alignToVideo(live, transcript);
-    if (align.offsetMs != null) {
-      alignOffsetMs = align.offsetMs;
-      for (const c of resolvedCands) {
-        const info = attributeWindow(live, align.offsetMs, c.start, c.end);
-        if (info.primary) {
-          c.speaker = info.primary;
-          c.speakers = info.shares;
-          // Time-resolved spans so the burned nameplate tracks who's talking.
-          c.speakerSpans = speakerSpans(live, align.offsetMs, c.start, c.end);
-        }
+    for (const c of resolvedCands) {
+      const info = attributeWindow(liveLines, alignOffsetMs, c.start, c.end);
+      if (info.primary) {
+        c.speaker = info.primary;
+        c.speakers = info.shares;
+        // Time-resolved spans so the burned nameplate tracks who's talking.
+        c.speakerSpans = speakerSpans(liveLines, alignOffsetMs, c.start, c.end);
       }
-      const who = [...new Set(resolvedCands.map(c => c.speaker).filter(Boolean))].join(", ");
-      log(`  aligned (offset ${(align.offsetMs / 1000).toFixed(1)}s · ${align.matches} matches) → ${who || "none"}`);
-    } else {
-      log(`  could not align live transcript — leaving speakers unset`);
     }
+    const who = [...new Set(resolvedCands.map(c => c.speaker).filter(Boolean))].join(", ");
+    log(`  attributed → ${who || "none"}`);
   }
 
   // Context-aware caption correction: recover crypto/AI jargon + proper nouns
@@ -218,7 +243,7 @@ async function main() {
     if (allCovered && Object.keys(captions).length) {
       log(`  loaded cached captions`);
     } else {
-      captions = await refineCaptions(resolvedCands, transcript, ep.manifest.meta, m => log(`  ${m}`));
+      captions = await refineCaptions(resolvedCands, transcript, ep.manifest.meta, m => log(`  ${m}`), research);
       await writeFile(capPath, JSON.stringify(captions, null, 2));
     }
   }

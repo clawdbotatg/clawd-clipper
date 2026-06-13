@@ -1,6 +1,6 @@
 import { findSpan } from "./anchor.js";
 import { gatewayUrl } from "./resolve.js";
-import type { Transcript } from "./transcribe.js";
+import type { Segment, Transcript } from "./transcribe.js";
 
 // Speaker attribution — recovers WHO is talking, which the re-transcription
 // throws away. whisper gives us word-accurate text + timing but no speakers;
@@ -124,6 +124,27 @@ export function attributeWindow(
     .map(([speaker, chars]) => ({ speaker, chars, pct: Math.round((100 * chars) / total) }))
     .sort((a, b) => b.chars - a.chars);
   return { primary: shares[0]!.speaker, shares };
+}
+
+/**
+ * Attribute a speaker handle to each whisper segment, so the candidate selector
+ * can read the transcript as `binji: …` instead of anonymous text — which lets
+ * it find back-and-forths and attribute hot-takes to a person. Same ownership
+ * model as {@link speakerSpans}: a live line's `ts` is ~the end of its utterance,
+ * so it owns the stretch up to that point; a segment is labelled by the live line
+ * whose ownership covers the segment's midpoint. Returns an array parallel to
+ * `segments` (null where no line owns that time). Best-effort — purely a prompt
+ * hint; the verbatim quotes the model returns still match the raw whisper text.
+ */
+export function labelSegments(segments: Segment[], live: LiveLine[], offsetMs: number): (string | null)[] {
+  const pts = live.map(l => ({ t: (l.ts - offsetMs) / 1000, speaker: l.speaker })).sort((a, b) => a.t - b.t);
+  if (!pts.length) return segments.map(() => null);
+  return segments.map(seg => {
+    const mid = (seg.start + seg.end) / 2;
+    // First live line whose utterance-end is at/after the segment midpoint owns it.
+    const owner = pts.find(p => p.t >= mid);
+    return (owner ?? pts[pts.length - 1]!).speaker;
+  });
 }
 
 /** A stretch of clip-relative time (seconds from the clip's start) owned by one

@@ -101,7 +101,7 @@ function applyEdits(words: Word[], edits: Edit[] | undefined): { tokens: Caption
   return { tokens, applied };
 }
 
-function buildPrompt(clips: { words: Word[] }[], meta: EpisodeMeta | undefined): string {
+function buildPrompt(clips: { words: Word[] }[], meta: EpisodeMeta | undefined, research?: string): string {
   const hints: string[] = [];
   if (meta?.title) hints.push(`Episode title: ${meta.title}`);
   if (meta?.oneLiner) hints.push(`One-liner: ${meta.oneLiner}`);
@@ -109,6 +109,7 @@ function buildPrompt(clips: { words: Word[] }[], meta: EpisodeMeta | undefined):
   if (meta?.topics?.length) hints.push(`Topics: ${meta.topics.join(", ")}`);
   if (meta?.chapters?.length)
     hints.push(`Chapters: ${meta.chapters.map(c => `${mmss(c.tStart)} ${c.title}`).join(" | ")}`);
+  const dossier = research?.trim();
 
   const blocks = clips
     .map((c, i) => {
@@ -132,7 +133,7 @@ RULES:
 
 GLOSSARY (intended spellings / the distinction that matters):
 ${GLOSSARY.map(g => `- ${g}`).join("\n")}
-
+${dossier ? `\nGUEST RESEARCH (this episode's guest — correctly-spelled names, handles, and projects; trust these spellings):\n${dossier}\n` : ""}
 ${hints.length ? `EPISODE CONTEXT (what this show was about):\n${hints.join("\n")}\n` : ""}
 CLIPS:
 ${blocks}
@@ -153,6 +154,7 @@ export async function refineCaptions(
   transcript: Transcript,
   meta: EpisodeMeta | undefined,
   log: (m: string) => void = () => {},
+  research?: string,
 ): Promise<Captions> {
   const out: Captions = {};
   if (!clips.length) return out;
@@ -161,7 +163,7 @@ export async function refineCaptions(
 
   let byIndex = new Map<number, Edit[]>();
   try {
-    const raw = await complete(buildPrompt(windows, meta), config.refineModel);
+    const raw = await complete(buildPrompt(windows, meta, research), config.refineModel);
     const parsed = extractJson<{ clips?: { index: number; edits?: Edit[] }[] }>(raw);
     for (const entry of parsed.clips ?? []) {
       if (typeof entry?.index === "number") byIndex.set(entry.index, entry.edits ?? []);

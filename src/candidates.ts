@@ -25,10 +25,19 @@ function mmss(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function buildPrompt(transcript: Transcript, meta: EpisodeMeta | undefined, target: number): string {
+function buildPrompt(transcript: Transcript, meta: EpisodeMeta | undefined, target: number, ctx: SelectionContext): string {
   // Segment-level view keeps the prompt compact while still giving the model
   // copyable verbatim phrases. Word timing is recovered later from the quotes.
-  const lines = transcript.segments.map(s => `[${mmss(s.start)}] ${s.text}`).join("\n");
+  // When speaker labels are available, prefix each line `handle: text` so the
+  // model can spot exchanges and attribute takes — the quote text itself is
+  // unchanged, so anchor.ts still matches against the raw whisper words.
+  const labels = ctx.speakerLabels;
+  const lines = transcript.segments
+    .map((s, i) => {
+      const who = labels?.[i];
+      return who ? `[${mmss(s.start)}] ${who}: ${s.text}` : `[${mmss(s.start)}] ${s.text}`;
+    })
+    .join("\n");
 
   const hints: string[] = [];
   if (meta?.title) hints.push(`Episode title: ${meta.title}`);
@@ -36,6 +45,9 @@ function buildPrompt(transcript: Transcript, meta: EpisodeMeta | undefined, targ
   if (meta?.description) hints.push(`Description: ${meta.description}`);
   if (meta?.topics?.length) hints.push(`Topics: ${meta.topics.join(", ")}`);
   if (meta?.chapters?.length) hints.push(`Chapters: ${meta.chapters.map(c => `${mmss(c.tStart)} ${c.title}`).join(" | ")}`);
+
+  const research = ctx.research?.trim();
+  const chat = ctx.chatReactions?.trim();
 
   return `You are a video editor for "slop.computer", a live podcast for technical builders working with AI agents, LLM tooling, dev tools, and crypto/web3 crossover. Your job: mine a finished episode for the most SHAREABLE short clips — the moments someone would post to X/Farcaster to make people want to watch the whole show.
 
@@ -51,9 +63,9 @@ Each clip must:
 - Be SELF-CONTAINED: it should land without the surrounding hour. Start at a natural sentence start, end on a natural beat.
 - Be roughly ${target} seconds of speech, and MUST fall within 10-40 seconds total. Pick start/end quotes that bound that much dialog.
 
-The transcript below is auto speech-to-text (expect minor errors; read charitably). Timestamps are [M:SS] from the start of the video.
+The transcript below is auto speech-to-text (expect minor errors; read charitably). Timestamps are [M:SS] from the start of the video.${labels ? " Each line is prefixed with the speaker's handle — use it to attribute takes and to spot good back-and-forths." : ""}
 
-${hints.length ? `CONTEXT (AI-generated metadata already produced for this episode — use as a guide to what mattered, not a constraint):\n${hints.join("\n")}\n` : ""}
+${research ? `GUEST RESEARCH (host's pre-show dossier — correctly-spelled names, projects, and links; use it to understand who's talking and to spell proper nouns right in titles):\n${research}\n` : ""}${hints.length ? `CONTEXT (AI-generated metadata already produced for this episode — use as a guide to what mattered, not a constraint):\n${hints.join("\n")}\n` : ""}${chat ? `AUDIENCE REACTIONS (the live chat lit up at these moments — a strong signal that something landed; weight clips that overlap these windows, but only if the SPOKEN moment is genuinely good on its own):\n${chat}\n` : ""}
 TRANSCRIPT:
 ${lines}
 
@@ -69,13 +81,25 @@ Return a JSON object: { "clips": [ ... ] } with 12-20 clip candidates, best firs
 OUTPUT ONLY THE JSON OBJECT. Start with { and end with }.`;
 }
 
+/** Optional, best-effort signals layered onto the selection prompt. Every field
+ *  degrades to today's behavior when absent. */
+export type SelectionContext = {
+  /** Per-segment speaker handles, parallel to `transcript.segments` (speakers.ts). */
+  speakerLabels?: (string | null)[];
+  /** Pre-formatted "the chat lit up here" block (chat.ts:chatReactions). */
+  chatReactions?: string;
+  /** Pre-show guest-research dossier text (correctly-spelled proper nouns). */
+  research?: string;
+};
+
 export async function selectCandidates(opts: {
   transcript: Transcript;
   meta?: EpisodeMeta;
   targetSeconds?: number;
+  context?: SelectionContext;
 }): Promise<RawCandidate[]> {
   const target = opts.targetSeconds ?? 25;
-  const raw = await complete(buildPrompt(opts.transcript, opts.meta, target));
+  const raw = await complete(buildPrompt(opts.transcript, opts.meta, target, opts.context ?? {}));
   const parsed = extractJson<{ clips?: RawCandidate[] }>(raw);
   const clips = parsed.clips ?? [];
   // Light shape sanitation; anchoring + range checks happen downstream.
