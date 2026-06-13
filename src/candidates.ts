@@ -17,6 +17,11 @@ export type RawCandidate = {
   score: number; // 0-100 shareability, model's own estimate
   tags: string[];
   kind?: string; // "hot-take" | "insight" | "funny" | "story" | "explainer" ...
+  // OPTIONAL (only when stitching is enabled + the model chose to): FOLLOW-UP
+  // spans to splice on AFTER the main start/end span, so a great moment broken by
+  // a throwaway interjection plays as one continuous statement with the dead part
+  // removed. Each is bounded by verbatim quotes like the main span.
+  segments?: { startQuote: string; endQuote: string }[];
 };
 
 function mmss(sec: number): string {
@@ -62,7 +67,9 @@ Avoid: pure logistics, dead air, mic checks, "can you hear me", rambling with no
 Each clip must:
 - Be SELF-CONTAINED: it should land without the surrounding hour. Start at a natural sentence start, end on a natural beat.
 - Be roughly ${target} seconds of speech, and MUST fall within 10-40 seconds total. Pick start/end quotes that bound that much dialog.
-
+${ctx.stitch ? `
+STITCHING (advanced — use RARELY): if a strong moment is broken up by a throwaway interjection (a filler reply like "yeah totally", a short tangent that adds nothing), you may surgically remove the dead part by returning extra "segments": the clip then plays the main start/end span, then each follow-up span, spliced back-to-back as ONE continuous statement. ONLY do this when the result genuinely reads as a single coherent thought and the removed bit truly contributes nothing — most clips must NOT use it, and never stitch just to cram in more. The summed spoken time across all spans still must fall within 10-40s, and every span's start must come after the previous span's end.
+` : ""}
 The transcript below is auto speech-to-text (expect minor errors; read charitably). Timestamps are [M:SS] from the start of the video.${labels ? " Each line is prefixed with the speaker's handle — use it to attribute takes and to spot good back-and-forths." : ""}
 
 ${research ? `GUEST RESEARCH (host's pre-show dossier — correctly-spelled names, projects, and links; use it to understand who's talking and to spell proper nouns right in titles):\n${research}\n` : ""}${hints.length ? `CONTEXT (AI-generated metadata already produced for this episode — use as a guide to what mattered, not a constraint):\n${hints.join("\n")}\n` : ""}${chat ? `AUDIENCE REACTIONS (the live chat lit up at these moments — a strong signal that something landed; weight clips that overlap these windows, but only if the SPOKEN moment is genuinely good on its own):\n${chat}\n` : ""}
@@ -77,7 +84,7 @@ Return a JSON object: { "clips": [ ... ] } with 12-20 clip candidates, best firs
 - "endQuote": a VERBATIM snippet (6-12 words) copied EXACTLY from the transcript line where the clip should END (the last thing said in the clip). Same verbatim rules. It MUST occur AFTER the startQuote and bound ~${target}s of speech.
 - "score": integer 0-100, your honest estimate of how shareable/impactful this clip is.
 - "tags": 2-5 short lowercase tags.
-
+${ctx.stitch ? `- "segments": OPTIONAL array — usually OMIT it. Only for a stitched clip: the FOLLOW-UP span(s) to play AFTER the main start/end span, each {"startQuote":"…","endQuote":"…"} with the SAME verbatim copy rules, each span occurring after the previous one. Omit entirely for normal clips.\n` : ""}
 OUTPUT ONLY THE JSON OBJECT. Start with { and end with }.`;
 }
 
@@ -90,6 +97,9 @@ export type SelectionContext = {
   chatReactions?: string;
   /** Pre-show guest-research dossier text (correctly-spelled proper nouns). */
   research?: string;
+  /** Allow the model to propose stitched (multi-span) clips. Off → the prompt
+   *  never mentions segments, so output + cache match the pre-stitch behavior. */
+  stitch?: boolean;
 };
 
 export async function selectCandidates(opts: {

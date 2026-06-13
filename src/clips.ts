@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { findSpan } from "./anchor.js";
 import { buildAss } from "./ass.js";
 import type { RawCandidate } from "./candidates.js";
-import { cutClip, cutClipVertical, libassBin, probeSize } from "./ffmpeg.js";
+import { cutClip, cutClipVertical, libassBin, probeSize, spliceSegments } from "./ffmpeg.js";
 import { clipKey } from "./judge.js";
 import { rawTokens, windowWords, type CaptionToken, type Captions } from "./refine.js";
 import type { Segment, Transcript, Word } from "./transcribe.js";
@@ -29,8 +29,13 @@ export type ResolvedClip = {
   score: number; // selection model's own shareability estimate (0-100)
   start: number;
   end: number;
-  duration: number;
+  duration: number; // actual clip length (for stitched clips, the SUM of spans, not end-start)
   text: string; // transcript inside the clip window
+  // Stitched clips only: the ordered word-gap-snapped spans (absolute episode
+  // seconds) that splice together into this clip. Absent → a normal contiguous
+  // clip (start..end). When present, `start`/`end` are the outer envelope and
+  // `duration` is the summed span length.
+  segments?: { start: number; end: number }[];
   // Filled in by the adversarial judge pass (judge.ts), if run:
   judgeScore?: number; // independent, skeptical re-score (0-100)
   critique?: string; // the judge's single biggest knock against the clip
@@ -189,10 +194,88 @@ function snapEndDown(transcript: Transcript, t: number): number | null {
   return null;
 }
 
-/** Resolve candidates to concrete time windows, dropping unanchorable / out-of-range ones. */
-export function resolveCandidates(candidates: RawCandidate[], transcript: Transcript): ResolvedClip[] {
+/**
+ * Resolve a STITCHED clip: each span's quotes are anchored, then snapped to
+ * word-gap silence (snapStart/snapEnd — the HARD RULE that cuts land between
+ * words, never mid-word) with the same breathing room as a normal clip edge.
+ * There's no per-span MIN (a span can be short); instead the SUMMED span length
+ * is bounded to [MIN, MAX]. Any bad/overlapping/out-of-order span drops the whole
+ * clip — a stitch is all-or-nothing. Returns the ordered spans + the envelope.
+ */
+function resolveCompound(
+  transcript: Transcript,
+  spanQuotes: { startQuote: string; endQuote: string }[],
+): { segments: { start: number; end: number }[]; start: number; end: number; duration: number; text: string } | null {
+  const segs: { start: number; end: number }[] = [];
+  let prevEnd = -Infinity;
+  for (const q of spanQuotes) {
+    const a = findSpan(transcript, q.startQuote, "first");
+    const b = findSpan(transcript, q.endQuote, "last");
+    if (!a || !b || b.end <= a.start) return null;
+    const s = Math.max(0, snapStart(transcript, a.start) - LEAD);
+    const e = Math.min(transcript.duration, snapEnd(transcript, b.end) + TAIL);
+    if (e - s < 0.5) return null; // degenerate span
+    if (s <= prevEnd) return null; // overlaps / out of order with the previous span
+    segs.push({ start: s, end: e });
+    prevEnd = e;
+  }
+  if (segs.length < 2) return null;
+  const duration = segs.reduce((acc, s) => acc + (s.end - s.start), 0);
+  if (duration < MIN || duration > MAX) return null;
+  const text = segs.map(s => wordsBetween(transcript.words, s.start, s.end)).join(" … ");
+  return { segments: segs, start: segs[0]!.start, end: segs[segs.length - 1]!.end, duration: +duration.toFixed(2), text };
+}
+
+/**
+ * Re-base each span's word tokens onto the spliced (contiguous) timeline: span k
+ * is shifted by the cumulative duration of the spans before it. Within-word
+ * timing (whisper word starts — what the karaoke highlight tracks) is preserved,
+ * so on the spliced clip the highlighted word stays the position-of-truth; the
+ * caller passes clipStart 0 to buildAss / buildSrt.
+ */
+export function splicedCaptionTokens(words: Word[], segments: { start: number; end: number }[]): CaptionToken[] {
+  const out: CaptionToken[] = [];
+  let offset = 0;
+  for (const seg of segments) {
+    const dur = seg.end - seg.start;
+    // Only words FULLY inside the span (same tolerance as wordsBetween) — a word
+    // straddling the seam must not be painted into both spans or past the cut.
+    for (const w of words.filter(x => x.start >= seg.start - 0.05 && x.end <= seg.end + 0.05)) {
+      const start = Math.min(dur, Math.max(0, w.start - seg.start));
+      const end = Math.min(dur, Math.max(0, w.end - seg.start));
+      out.push({ text: w.word.trim(), start: offset + start, end: offset + end });
+    }
+    offset += dur;
+  }
+  return out;
+}
+
+/** Resolve candidates to concrete time windows, dropping unanchorable / out-of-range ones.
+ *  With `stitch`, a candidate's optional `segments` produce a multi-span clip. */
+export function resolveCandidates(
+  candidates: RawCandidate[],
+  transcript: Transcript,
+  opts: { stitch?: boolean } = {},
+): ResolvedClip[] {
   const resolved = candidates
     .map(c => {
+      // Stitched path: main span + the model's follow-up spans, spliced in order.
+      if (opts.stitch && c.segments?.length) {
+        const comp = resolveCompound(transcript, [{ startQuote: c.startQuote, endQuote: c.endQuote }, ...c.segments]);
+        if (!comp) return null;
+        return {
+          title: c.title,
+          reason: c.reason,
+          kind: c.kind ?? "",
+          tags: Array.isArray(c.tags) ? c.tags : [],
+          score: Math.max(0, Math.min(100, Math.round(c.score))),
+          start: comp.start,
+          end: comp.end,
+          duration: comp.duration,
+          text: comp.text,
+          segments: comp.segments,
+        };
+      }
       const a = findSpan(transcript, c.startQuote, "first");
       const b = findSpan(transcript, c.endQuote, "last");
       if (!a || !b) return null;
@@ -216,9 +299,14 @@ export function resolveCandidates(candidates: RawCandidate[], transcript: Transc
     .sort((a, b) => b.score - a.score);
 
   // Greedy de-overlap: keep highest-scored, drop later ones that overlap it heavily.
+  // Skip the test when either side is stitched: a compound clip's [start,end] is
+  // its wide envelope (it jumps over a dropped gap), so envelope overlap would be
+  // misleading — it could swallow a contiguous clip living in that gap they don't
+  // actually share. Stitches are rare and reviewed before publish; let them stand.
   const kept: typeof resolved = [];
   for (const c of resolved) {
     const clash = kept.some(k => {
+      if (c.segments?.length || k.segments?.length) return false;
       const ov = Math.min(c.end, k.end) - Math.max(c.start, k.start);
       if (ov <= 0) return false;
       return ov / Math.min(c.duration, k.duration) > OVERLAP_DROP;
@@ -311,11 +399,37 @@ export async function buildClips(opts: {
     const base = `${rank.toString().padStart(2, "0")}_${slugify(c.title)}`;
     const file = `${base}.mp4`;
     const srt = `${base}.srt`;
-    // Caption tokens: the corrected ones if refine ran for this clip, else raw STT.
-    const tokens = opts.captions?.[clipKey(c)] ?? rawTokens(windowWords(opts.transcript.words, c.start, c.end));
+    // Stitched clip: splice its word-gap-snapped spans into one contiguous per-
+    // clip source FIRST, then treat it as a normal [0, duration] clip — every cut
+    // + caption path below works unchanged on `clipSource`. Captions are re-based
+    // onto the spliced timeline (so the highlight stays in sync) with clipStart 0.
+    const compound = !!(c.segments && c.segments.length > 1);
+    let clipSource = opts.source;
+    let cutStart = c.start;
+    let cutEnd = c.end;
+    let captionStart = c.start;
+    let splicedPath: string | null = null;
+    if (compound) {
+      splicedPath = join(opts.clipsDir, `${base}.spliced.mp4`);
+      await spliceSegments(opts.source, splicedPath, c.segments!);
+      clipSource = splicedPath;
+      cutStart = 0;
+      cutEnd = c.duration; // summed span length
+      captionStart = 0;
+    }
+    // The burned nameplate's spans are envelope-relative (and would name the
+    // dropped speaker) — meaningless on a spliced timeline, so suppress it for
+    // stitched clips. Captions are re-based above; nameplates aren't worth it here.
+    const nameplateSpans = compound ? undefined : c.speakerSpans;
+
+    // Caption tokens: stitched → re-based per-span raw tokens; single → the
+    // corrected ones if refine ran for this clip, else raw STT over the window.
+    const tokens = compound
+      ? splicedCaptionTokens(opts.transcript.words, c.segments!)
+      : (opts.captions?.[clipKey(c)] ?? rawTokens(windowWords(opts.transcript.words, c.start, c.end)));
 
     log(
-      `clip ${rank}/${list.length} [${c.finalScore ?? c.score}] ${c.title} (${c.duration}s${burnBin ? ", burning captions" : ""})`,
+      `clip ${rank}/${list.length} [${c.finalScore ?? c.score}] ${c.title} (${c.duration}s${compound ? `, ${c.segments!.length}-span stitch` : ""}${burnBin ? ", burning captions" : ""})`,
     );
 
     // Landscape (always): write the clip-relative ASS next to the mp4, then cut
@@ -325,15 +439,15 @@ export async function buildClips(opts: {
       const assName = `${base}.ass`;
       await writeFile(
         join(opts.clipsDir, assName),
-        buildAss(tokens, c.start, size.width, size.height, { speakerSpans: c.speakerSpans }),
+        buildAss(tokens, captionStart, size.width, size.height, { speakerSpans: nameplateSpans }),
       );
-      await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end, {
+      await cutClip(clipSource, join(opts.clipsDir, file), cutStart, cutEnd, {
         assFile: assName,
         bin: burnBin,
         cwd: opts.clipsDir,
       });
     } else {
-      await cutClip(opts.source, join(opts.clipsDir, file), c.start, c.end);
+      await cutClip(clipSource, join(opts.clipsDir, file), cutStart, cutEnd);
     }
 
     // Mobile (--vertical): a second cut into <base>.mobile.mp4 — the clip's
@@ -347,13 +461,13 @@ export async function buildClips(opts: {
       if (burnBin)
         await writeFile(
           join(opts.clipsDir, assName),
-          buildAss(tokens, c.start, 1080, 1920, {
+          buildAss(tokens, captionStart, 1080, 1920, {
             vertical: true,
             seamFrac: layout?.seamFrac,
-            speakerSpans: c.speakerSpans,
+            speakerSpans: nameplateSpans,
           }),
         );
-      await cutClipVertical(opts.source, join(opts.clipsDir, mobileFile), c.start, c.end, {
+      await cutClipVertical(clipSource, join(opts.clipsDir, mobileFile), cutStart, cutEnd, {
         tiles: layout?.tiles ?? null,
         assFile: burnBin ? assName : undefined,
         bin: burnBin ?? undefined,
@@ -375,9 +489,9 @@ export async function buildClips(opts: {
         if (burnBin)
           await writeFile(
             join(opts.clipsDir, altAssName),
-            buildAss(tokens, c.start, 1080, 1920, { vertical: true, seamFrac: altLayout.seamFrac, speakerSpans: c.speakerSpans }),
+            buildAss(tokens, captionStart, 1080, 1920, { vertical: true, seamFrac: altLayout.seamFrac, speakerSpans: nameplateSpans }),
           );
-        await cutClipVertical(opts.source, join(opts.clipsDir, altMobileFile), c.start, c.end, {
+        await cutClipVertical(clipSource, join(opts.clipsDir, altMobileFile), cutStart, cutEnd, {
           tiles: altLayout.tiles ?? null,
           assFile: burnBin ? altAssName : undefined,
           bin: burnBin ?? undefined,
@@ -387,7 +501,10 @@ export async function buildClips(opts: {
       }
     }
 
-    await writeFile(join(opts.clipsDir, srt), buildSrt(tokens, c.start));
+    await writeFile(join(opts.clipsDir, srt), buildSrt(tokens, captionStart));
+    // Drop the per-clip spliced intermediate — it's consumed by the cuts above
+    // and must not linger in clipsDir (publish pins the whole dir).
+    if (splicedPath) await rm(splicedPath, { force: true });
     clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile, altMobileFile });
   }
   return clips;

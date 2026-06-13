@@ -347,3 +347,58 @@ export async function cutClip(
   );
   await runCut(opts.bin ?? config.ffmpegBin, args, { cwd: opts.cwd });
 }
+
+/**
+ * Splice multiple source spans into one continuous re-encoded mp4 — the render
+ * primitive behind stitched clips. Each span is trimmed and timestamp-reset, then
+ * the spans are concatenated in order (audio + video together) via the concat
+ * filter, so the result plays as one gapless clip. The seam between spans is
+ * chosen on word-gap silence upstream (clips.ts), so cuts land cleanly. The
+ * output is a normal contiguous clip: downstream cutClip / cutClipVertical treat
+ * it as a [0, totalDuration] source, and captions are re-based to match.
+ */
+export async function spliceSegments(
+  source: string,
+  dest: string,
+  segments: { start: number; end: number }[],
+  opts: { bin?: string } = {},
+): Promise<void> {
+  const parts: string[] = [];
+  const labels: string[] = [];
+  segments.forEach((s, i) => {
+    const a = s.start.toFixed(3);
+    const b = s.end.toFixed(3);
+    parts.push(`[0:v]trim=start=${a}:end=${b},setpts=PTS-STARTPTS[v${i}]`);
+    parts.push(`[0:a]atrim=start=${a}:end=${b},asetpts=PTS-STARTPTS[a${i}]`);
+    labels.push(`[v${i}][a${i}]`);
+  });
+  const filter = `${parts.join(";")};${labels.join("")}concat=n=${segments.length}:v=1:a=1[v][a]`;
+  await runCut(opts.bin ?? config.ffmpegBin, [
+    "-y",
+    "-i",
+    source,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[v]",
+    "-map",
+    "[a]",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "20",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "160k",
+    "-movflags",
+    "+faststart",
+    "-loglevel",
+    "error",
+    dest,
+  ]);
+}

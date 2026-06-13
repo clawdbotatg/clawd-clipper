@@ -38,6 +38,7 @@ import { config } from "./config.js";
 //   yarn clip <slug> --no-burn       don't burn karaoke captions into the video
 //   yarn clip <slug> --no-tweets     skip generating suggested post copy per clip
 //   yarn clip <slug> --vertical      render 9:16 mobile clips (stacked speaker tiles)
+//   yarn clip <slug> --stitch        allow stitched (multi-span) clips — splice out a dead interjection
 //   yarn clip <slug> --force         ignore caches (re-download, re-transcribe)
 
 type Args = {
@@ -51,12 +52,13 @@ type Args = {
   tweets: boolean;
   vertical: boolean;
   publish: boolean;
+  stitch: boolean;
   force: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false };
+  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false, stitch: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
@@ -66,6 +68,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--no-tweets") out.tweets = false;
     else if (a === "--vertical") out.vertical = true;
     else if (a === "--publish") ((out.publish = true), (out.vertical = true)); // publish pins the 9:16 clips → implies --vertical
+    else if (a === "--stitch") out.stitch = true; // allow stitched (multi-span) clips
     else if (a === "--manifest") out.manifest = argv[++i];
     else if (a === "--limit") out.limit = Number(argv[++i]);
     else if (a === "--target") out.target = Number(argv[++i]);
@@ -74,7 +77,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (!positional[0])
     throw new Error(
-      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--force]",
+      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--stitch] [--force]",
     );
   return {
     slug: positional[0],
@@ -85,6 +88,7 @@ function parseArgs(argv: string[]): Args {
     tweets: out.tweets ?? true,
     vertical: out.vertical ?? false,
     publish: out.publish ?? false,
+    stitch: out.stitch ?? false,
     force: out.force ?? false,
   };
 }
@@ -172,14 +176,15 @@ async function main() {
       transcript,
       meta: ep.manifest.meta,
       targetSeconds: args.target,
-      context: { speakerLabels, chatReactions: chatBlock, research },
+      context: { speakerLabels, chatReactions: chatBlock, research, stitch: args.stitch },
     });
     await writeFile(candPath, JSON.stringify(candidates, null, 2));
     log(`  model proposed ${candidates.length} candidates`);
   }
 
-  let resolvedCands = resolveCandidates(candidates, transcript);
-  log(`  ${resolvedCands.length} anchored to real timestamps + in range`);
+  let resolvedCands = resolveCandidates(candidates, transcript, { stitch: args.stitch });
+  const stitched = resolvedCands.filter(c => c.segments?.length).length;
+  log(`  ${resolvedCands.length} anchored to real timestamps + in range${stitched ? ` (${stitched} stitched)` : ""}`);
 
   if (args.judge && resolvedCands.length) {
     log(`\n▸ adversarial judge re-rank…`);
@@ -243,7 +248,10 @@ async function main() {
     if (allCovered && Object.keys(captions).length) {
       log(`  loaded cached captions`);
     } else {
-      captions = await refineCaptions(resolvedCands, transcript, ep.manifest.meta, m => log(`  ${m}`), research);
+      // Stitched clips re-base their captions from per-span raw words in
+      // buildClips (the contiguous-window refine pass can't represent a splice),
+      // so only the single-span clips go through correction here.
+      captions = await refineCaptions(resolvedCands.filter(c => !c.segments?.length), transcript, ep.manifest.meta, m => log(`  ${m}`), research);
       await writeFile(capPath, JSON.stringify(captions, null, 2));
     }
   }
@@ -329,9 +337,13 @@ async function main() {
       await mkdir(framesDir, { recursive: true });
       for (const c of missing) {
         const key = clipKey(c);
+        // For a stitched clip the envelope midpoint falls in the DROPPED gap, so
+        // detect windows inside the first real span instead. (Window layout is
+        // ~static per episode; this just guarantees a representative frame.)
+        const det = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
         let wins: DetectedWindow[] = [];
         if (geomLog && geomOffsetMs != null) {
-          const midMs = ((c.start + c.end) / 2) * 1000 + geomOffsetMs;
+          const midMs = ((det.start + det.end) / 2) * 1000 + geomOffsetMs;
           wins = windowsAt(geomLog, midMs, geomNames);
           if (wins.length) log(`  ${c.title.slice(0, 36)} — ${wins.length} windows from geometry log`);
         }
@@ -339,8 +351,8 @@ async function main() {
           wins = await detectClipWindows({
             source,
             framePath: join(framesDir, `${key}.png`),
-            startSec: c.start,
-            endSec: c.end,
+            startSec: det.start,
+            endSec: det.end,
             participants: [...new Set(Object.values(geomNames))],
             log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
           });
@@ -496,7 +508,10 @@ async function main() {
     for (const c of resolvedCands) {
       const key = clipKey(c);
       const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
-      const geomWins = altGeom && altOffsetMs != null ? windowsAt(altGeom, ((c.start + c.end) / 2) * 1000 + altOffsetMs, altNames) : [];
+      // For a stitch, the envelope midpoint lands in the dropped gap — sample the
+      // first real span instead (mirrors the primary detection above).
+      const altDet = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
+      const geomWins = altGeom && altOffsetMs != null ? windowsAt(altGeom, ((altDet.start + altDet.end) / 2) * 1000 + altOffsetMs, altNames) : [];
       let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height, composeOpts(c)) : null;
       const def = layouts[key];
       if (!alt || (def && layoutsSimilar(alt, def))) {
