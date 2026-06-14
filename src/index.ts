@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { selectCandidates, type RawCandidate } from "./candidates.js";
-import { buildClips, resolveCandidates } from "./clips.js";
+import { buildClips, resolveCandidates, type StitchDiag } from "./clips.js";
 import { downloadFile } from "./download.js";
 import { writeGallery } from "./gallery.js";
 import { applyVerdicts, clipKey, getVerdicts, type JudgeVerdict } from "./judge.js";
@@ -182,9 +182,28 @@ async function main() {
     log(`  model proposed ${candidates.length} candidates`);
   }
 
-  let resolvedCands = resolveCandidates(candidates, transcript, { stitch: args.stitch });
+  // Stitch decisions are logged AND persisted to out/<slug>/stitches.json so a
+  // later inspection can see exactly what the model tried, what got spliced
+  // (which spans, how much dead air was cut), and why any attempt was dropped.
+  const stitchDiags: StitchDiag[] = [];
+  let resolvedCands = resolveCandidates(candidates, transcript, {
+    stitch: args.stitch,
+    onStitch: d => {
+      stitchDiags.push(d);
+      if (d.resolved) {
+        const cut = (d.cutSec ?? []).reduce((a, b) => a + b, 0);
+        log(`  stitch ✓ "${d.title}" — ${d.segments!.length} spans, kept ${d.durationSec}s, cut ${cut.toFixed(1)}s of dead air`);
+      } else {
+        log(`  stitch ✗ "${d.title}" — dropped: ${d.reason}`);
+      }
+    },
+  });
   const stitched = resolvedCands.filter(c => c.segments?.length).length;
-  log(`  ${resolvedCands.length} anchored to real timestamps + in range${stitched ? ` (${stitched} stitched)` : ""}`);
+  log(
+    `  ${resolvedCands.length} anchored to real timestamps + in range` +
+      (args.stitch ? ` · stitches: ${stitched} kept, ${stitchDiags.length - stitched} dropped (see out/${args.slug}/stitches.json)` : ""),
+  );
+  if (args.stitch) await writeFile(join(outDir, "stitches.json"), JSON.stringify(stitchDiags, null, 2));
 
   if (args.judge && resolvedCands.length) {
     log(`\n▸ adversarial judge re-rank…`);

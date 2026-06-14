@@ -202,29 +202,47 @@ function snapEndDown(transcript: Transcript, t: number): number | null {
  * is bounded to [MIN, MAX]. Any bad/overlapping/out-of-order span drops the whole
  * clip — a stitch is all-or-nothing. Returns the ordered spans + the envelope.
  */
+type CompoundResolved = { segments: { start: number; end: number }[]; start: number; end: number; duration: number; text: string };
+
 function resolveCompound(
   transcript: Transcript,
   spanQuotes: { startQuote: string; endQuote: string }[],
-): { segments: { start: number; end: number }[]; start: number; end: number; duration: number; text: string } | null {
+): { ok: true; value: CompoundResolved } | { ok: false; reason: string } {
   const segs: { start: number; end: number }[] = [];
   let prevEnd = -Infinity;
-  for (const q of spanQuotes) {
+  for (let i = 0; i < spanQuotes.length; i++) {
+    const q = spanQuotes[i]!;
     const a = findSpan(transcript, q.startQuote, "first");
     const b = findSpan(transcript, q.endQuote, "last");
-    if (!a || !b || b.end <= a.start) return null;
+    if (!a) return { ok: false, reason: `span ${i + 1} startQuote not found: "${q.startQuote}"` };
+    if (!b) return { ok: false, reason: `span ${i + 1} endQuote not found: "${q.endQuote}"` };
+    if (b.end <= a.start) return { ok: false, reason: `span ${i + 1} end is before its start` };
     const s = Math.max(0, snapStart(transcript, a.start) - LEAD);
     const e = Math.min(transcript.duration, snapEnd(transcript, b.end) + TAIL);
-    if (e - s < 0.5) return null; // degenerate span
-    if (s <= prevEnd) return null; // overlaps / out of order with the previous span
+    if (e - s < 0.5) return { ok: false, reason: `span ${i + 1} is degenerate (<0.5s)` };
+    if (s <= prevEnd) return { ok: false, reason: `span ${i + 1} overlaps or precedes span ${i}` };
     segs.push({ start: s, end: e });
     prevEnd = e;
   }
-  if (segs.length < 2) return null;
+  if (segs.length < 2) return { ok: false, reason: "fewer than 2 valid spans" };
   const duration = segs.reduce((acc, s) => acc + (s.end - s.start), 0);
-  if (duration < MIN || duration > MAX) return null;
+  if (duration < MIN || duration > MAX) return { ok: false, reason: `summed duration ${duration.toFixed(1)}s outside [${MIN},${MAX}]` };
   const text = segs.map(s => wordsBetween(transcript.words, s.start, s.end)).join(" … ");
-  return { segments: segs, start: segs[0]!.start, end: segs[segs.length - 1]!.end, duration: +duration.toFixed(2), text };
+  return { ok: true, value: { segments: segs, start: segs[0]!.start, end: segs[segs.length - 1]!.end, duration: +duration.toFixed(2), text } };
 }
+
+/** Diagnostic record for one model-proposed stitch — written to out/<slug>/stitches.json
+ *  and logged, so a later inspection can see what the model tried and why it was
+ *  kept or dropped. */
+export type StitchDiag = {
+  title: string;
+  spanQuotes: { startQuote: string; endQuote: string }[];
+  resolved: boolean;
+  reason?: string; // why it was dropped (when !resolved)
+  segments?: { start: number; end: number }[]; // resolved spans, absolute episode seconds
+  durationSec?: number; // summed span length actually kept
+  cutSec?: number[]; // duration of each gap removed between consecutive spans
+};
 
 /**
  * Re-base each span's word tokens onto the spliced (contiguous) timeline: span k
@@ -255,25 +273,40 @@ export function splicedCaptionTokens(words: Word[], segments: { start: number; e
 export function resolveCandidates(
   candidates: RawCandidate[],
   transcript: Transcript,
-  opts: { stitch?: boolean } = {},
+  opts: { stitch?: boolean; onStitch?: (d: StitchDiag) => void } = {},
 ): ResolvedClip[] {
   const resolved = candidates
     .map(c => {
       // Stitched path: main span + the model's follow-up spans, spliced in order.
       if (opts.stitch && c.segments?.length) {
-        const comp = resolveCompound(transcript, [{ startQuote: c.startQuote, endQuote: c.endQuote }, ...c.segments]);
-        if (!comp) return null;
+        const spanQuotes = [{ startQuote: c.startQuote, endQuote: c.endQuote }, ...c.segments];
+        const comp = resolveCompound(transcript, spanQuotes);
+        if (!comp.ok) {
+          opts.onStitch?.({ title: c.title, spanQuotes, resolved: false, reason: comp.reason });
+          return null;
+        }
+        const segs = comp.value.segments;
+        // Gap durations removed between consecutive kept spans — the "dead middle".
+        const cutSec = segs.slice(1).map((s, i) => +(s.start - segs[i]!.end).toFixed(1));
+        opts.onStitch?.({
+          title: c.title,
+          spanQuotes,
+          resolved: true,
+          segments: segs,
+          durationSec: comp.value.duration,
+          cutSec,
+        });
         return {
           title: c.title,
           reason: c.reason,
           kind: c.kind ?? "",
           tags: Array.isArray(c.tags) ? c.tags : [],
           score: Math.max(0, Math.min(100, Math.round(c.score))),
-          start: comp.start,
-          end: comp.end,
-          duration: comp.duration,
-          text: comp.text,
-          segments: comp.segments,
+          start: comp.value.start,
+          end: comp.value.end,
+          duration: comp.value.duration,
+          text: comp.value.text,
+          segments: segs,
         };
       }
       const a = findSpan(transcript, c.startQuote, "first");

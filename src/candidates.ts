@@ -68,7 +68,8 @@ Each clip must:
 - Be SELF-CONTAINED: it should land without the surrounding hour. Start at a natural sentence start, end on a natural beat.
 - Be roughly ${target} seconds of speech, and MUST fall within 10-40 seconds total. Pick start/end quotes that bound that much dialog.
 ${ctx.stitch ? `
-STITCHING (advanced — use RARELY): if a strong moment is broken up by a throwaway interjection (a filler reply like "yeah totally", a short tangent that adds nothing), you may surgically remove the dead part by returning extra "segments": the clip then plays the main start/end span, then each follow-up span, spliced back-to-back as ONE continuous statement. ONLY do this when the result genuinely reads as a single coherent thought and the removed bit truly contributes nothing — most clips must NOT use it, and never stitch just to cram in more. The summed spoken time across all spans still must fall within 10-40s, and every span's start must come after the previous span's end.
+STITCHING (a sharp editing tool — actively look for it): some of the best clips are buried. A guest says something great, then someone interjects with a throwaway line or a brief tangent, then the speaker lands the real point a few seconds later. A human editor would cut out the dead middle and splice the good parts into one clean statement — you can do exactly that by returning extra "segments". The clip then plays the main start/end span, then each follow-up span, back-to-back as ONE continuous thought with the junk removed.
+Scan the transcript for these and RECOVER them — aim to find 1-3 per episode when they genuinely exist (it's fine to find none if the episode is clean). Good cuts to remove: filler replies ("yeah totally", "right right"), a quick interruption, a short aside that adds nothing. Quality bar: the spliced result MUST read as one coherent thought, not a jumpcut montage — never staple unrelated points together just to cram more in. Summed spoken time across all spans must fall within 10-40s, and every span's start must come after the previous span's end.
 ` : ""}
 The transcript below is auto speech-to-text (expect minor errors; read charitably). Timestamps are [M:SS] from the start of the video.${labels ? " Each line is prefixed with the speaker's handle — use it to attribute takes and to spot good back-and-forths." : ""}
 
@@ -84,7 +85,7 @@ Return a JSON object: { "clips": [ ... ] } with 12-20 clip candidates, best firs
 - "endQuote": a VERBATIM snippet (6-12 words) copied EXACTLY from the transcript line where the clip should END (the last thing said in the clip). Same verbatim rules. It MUST occur AFTER the startQuote and bound ~${target}s of speech.
 - "score": integer 0-100, your honest estimate of how shareable/impactful this clip is.
 - "tags": 2-5 short lowercase tags.
-${ctx.stitch ? `- "segments": OPTIONAL array — usually OMIT it. Only for a stitched clip: the FOLLOW-UP span(s) to play AFTER the main start/end span, each {"startQuote":"…","endQuote":"…"} with the SAME verbatim copy rules, each span occurring after the previous one. Omit entirely for normal clips.\n` : ""}
+${ctx.stitch ? `- "segments": OPTIONAL array. Include it whenever stitching recovers a buried moment (see STITCHING above): the FOLLOW-UP span(s) to play AFTER the main start/end span, each {"startQuote":"…","endQuote":"…"} with the SAME verbatim copy rules, each span occurring after the previous one. Omit it for clips that are already clean as a single span.\n` : ""}
 OUTPUT ONLY THE JSON OBJECT. Start with { and end with }.`;
 }
 

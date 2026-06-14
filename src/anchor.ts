@@ -9,6 +9,11 @@ import type { Transcript, Word } from "./transcribe.js";
 const norm = (s: string) =>
   s
     .toLowerCase()
+    // Drop apostrophes (ascii + unicode) so a contraction stays ONE token:
+    // "It's" -> "its", not "it s". Otherwise the per-word token "it s" (with an
+    // internal space) could never match the quote's split ["it","s"], and any
+    // quote containing a contraction failed to anchor — silently dropping clips.
+    .replace(/['‘’]/g, "")
     .replace(/[^a-z0-9 ]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -19,7 +24,11 @@ function tokens(words: Word[]): Tok[] {
   const out: Tok[] = [];
   for (const w of words) {
     const n = norm(w.word);
-    if (n) out.push({ n, start: w.start, end: w.end });
+    if (!n) continue;
+    // A single STT word can still normalize to multiple parts (e.g. "GPT-4o" ->
+    // "gpt 4o"); emit one token per part (sharing the word's timing) so a quote
+    // that splits the same way matches token-for-token.
+    for (const part of n.split(" ")) out.push({ n: part, start: w.start, end: w.end });
   }
   return out;
 }
