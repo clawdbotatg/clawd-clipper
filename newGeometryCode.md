@@ -73,6 +73,17 @@ These new log entries are tagged `src:"god"` and carry the browser size
 still exists as a fallback for already-recorded episodes, gated behind an env
 flag.
 
+**Important — geometry does NOT replace the CV detector; it runs *alongside* it.**
+The proven pixel/CV detector still frames the **primary** 9:16 clip. Geometry
+drives a **separate, parallel** 9:16 take so the two can be compared (and you can
+flip which is "primary" later, once geometry is trusted). So a `--vertical` clip
+now renders up to **four** outputs: the 16:9 landscape, plus three 9:16 framings —
+CV (`.mobile.mp4`, primary), geometry (`.geom.mobile.mp4`), and the
+deliberately-different alt-composition (`.alt.mobile.mp4`, full-screen / swapped).
+The gallery's top buttons toggle all clips between them; `--publish` pins all of
+them and the admin can pick. (Cost: ~4 re-encoded cuts per clip — heavier, but
+that's the point during the trust-building phase.)
+
 ### The data flow (two repos)
 
 ```
@@ -93,8 +104,11 @@ flag.
  clipper (clawd-clipper)
    geometry.ts       — windowsAt() converts god rects to frame fractions
                         with x/vw, y/vh (prefers them over legacy slot lines)
-   index.ts          — auto-uses the log when it has god entries; skips the
-                        slow vision pass
+   index.ts          — CV detector drives the PRIMARY 9:16; the god log drives
+                        a SEPARATE parallel geometry take (not a replacement)
+   clips.ts          — cuts each 9:16 take (CV / geometry / alt) to its own file
+   gallery.ts        — top buttons toggle all clips between the takes
+   publish.ts        — pins each take into clips.json for the admin to pick
 ```
 
 ### Files touched (so you can find them later)
@@ -116,8 +130,12 @@ flag.
 - `src/geometry.ts` — `windowsAt()` now keeps god vs legacy rects separate and
   prefers god; `logHasGodGeometry()` detects the new format. The big comment at
   the top explains both coordinate bases.
-- `src/index.ts` — one geometry fetch+decision (reused by the main + ALT layout);
-  auto-uses god-frame logs.
+- `src/index.ts` — one geometry fetch+decision; CV drives the primary 9:16,
+  geometry drives a separate parallel take, alt-composition is its own take.
+- `src/clips.ts` — `cutVertical()` helper cuts each 9:16 take to its own file
+  (`.mobile` / `.geom.mobile` / `.alt.mobile`).
+- `src/gallery.ts` — switcher buttons (16:9 · CV · geometry · alt).
+- `src/publish.ts` — pins the geometry take (`geomMobile`) alongside the rest.
 
 ---
 
@@ -167,14 +185,17 @@ flag.
 1. Run a real show on the new build, finalize it (so `geometry.jsonl` gets pinned
    and `manifest.geometry.cid` is set).
 2. `yarn clip <slug> --vertical` — watch the log line. You want to see:
-   `geometry log: N events — god-frame rects (exact recorded geometry); using it, skipping vision`.
-   If instead you see "legacy slot coords" or "present but legacy", the god
-   logging didn't happen — check the `data-slot-id` assumption above.
+   `geometry log: N events — god-frame rects (exact recorded geometry); driving the geometry 9:16 take`.
+   If instead you see "legacy slot coords" or "present but legacy ... skipping the
+   geometry take", the god logging didn't happen — check the `data-slot-id`
+   assumption above.
 3. `yarn compare <slug>` then open `out/<slug>/compare.html`. This shows, per
    clip, the computer-vision boxes (left) vs the geometry boxes (right) with an
    **IoU** number (1.0 = perfect overlap). **Success = mean IoU near ~1, and both
    cameras land correctly** (the thing the old approach couldn't do).
-4. Eyeball a couple of the actual `*.mobile.mp4` clips — faces centered, no
+4. Eyeball the takes side by side: open `out/<slug>/index.html` and use the top
+   buttons (16:9 · CV · geometry · alt) to flip all clips between framings —
+   compare `.mobile.mp4` (CV) vs `.geom.mobile.mp4` (geometry). Faces centered, no
    half-window crops.
 
 If something's off, the safe fallback is always there: the clipper uses computer

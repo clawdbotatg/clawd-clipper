@@ -26,7 +26,9 @@ import type { DetectedWindow, WinKind } from "./vertical.js";
 //    is just x/vw, y/vh — one clean affine, no calibration constant, and it
 //    reconciles every window (cameras included). This is the fix for the failure
 //    the LEGACY basis below hit. logHasGodGeometry() detects it; index.ts then
-//    uses geometry automatically (no CLIPPER_USE_GEOMETRY needed).
+//    drives a SEPARATE geometry 9:16 take from it (no CLIPPER_USE_GEOMETRY
+//    needed) — the CV/pixel detector still drives the primary take, so the two
+//    framings render in parallel and can be A/B'd (yarn compare).
 //
 //    LEGACY (slot-px, older episodes): rects are the relay's interactive
 //    god-desktop SLOT coords, in whoever-last-moved-the-window's viewport px —

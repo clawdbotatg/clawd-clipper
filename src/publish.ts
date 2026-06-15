@@ -21,11 +21,15 @@ export type ClipBundleEntry = {
   endSec: number;
   durationSec: number;
   speakers: string[];
-  mobile: { cid: string; w: number; h: number; format: string; sizeBytes: number };
+  mobile: { cid: string; w: number; h: number; format: string; sizeBytes: number }; // CV/pixel detector — the default 9:16
   poster?: { cid: string; format: string }; // 9:16 first-frame
-  /** The ALT 9:16 take (geometry-detector / alt-config) + its poster — a second,
-   *  deliberately-different vertical cut the admin view offers next to the
-   *  default 9:16. Absent when no alt layout was produced. */
+  /** The god-frame GEOMETRY 9:16 take + its poster — the geometry detector's
+   *  framing, parallel to the CV `mobile`, for A/B. Absent when no geometry log
+   *  covered the clip. */
+  geomMobile?: { cid: string; w: number; h: number; format: string; sizeBytes: number; poster?: { cid: string; format: string } };
+  /** The ALT 9:16 take (alt-composition — a different VIEW, not a different
+   *  detector: full-screen / swapped speakers) + its poster — a second vertical
+   *  cut the admin view offers next to the default. Absent when no alt layout. */
   altMobile?: { cid: string; w: number; h: number; format: string; sizeBytes: number; poster?: { cid: string; format: string } };
   /** The 16:9 landscape cut (Clip.file) + its own poster — published alongside
    *  the 9:16 so the admin view offers both formats for posting. */
@@ -113,24 +117,27 @@ export async function publishClips(opts: {
       log(`  [${i + 1}/${withMobile.length}] + landscape ${c.file} → ${l.cid}`);
     }
 
-    // ALT 9:16 take (Clip.altMobileFile) — pin it + a poster so the admin view
-    // can offer "ALT 9:16" next to the default. Doubles the 9:16 footprint.
-    let altMobile: ClipBundleEntry["altMobile"];
-    if (c.altMobileFile && (await exists(join(opts.clipsDir, c.altMobileFile)))) {
-      const aPath = join(opts.clipsDir, c.altMobileFile);
-      const a = await pinFile(opts.apiUrl, aPath);
-      let aposter: { cid: string; format: string } | undefined;
+    // Pin a secondary 9:16 variant (+ its poster) and return the bundle entry
+    // shape. Shared by the geometry and alt-composition takes; the primary
+    // `mobile` is pinned above and gates `withMobile`. Each adds to the footprint.
+    const pinVariant = async (file: string | undefined, label: string): Promise<ClipBundleEntry["altMobile"]> => {
+      if (!file || !(await exists(join(opts.clipsDir, file)))) return undefined;
+      const vpath = join(opts.clipsDir, file);
+      const vf = await pinFile(opts.apiUrl, vpath);
+      let vposter: { cid: string; format: string } | undefined;
       if (opts.posters !== false) {
-        const app = `${aPath}.poster.jpg`;
-        if (await makePoster(aPath, app)) {
-          const p = await pinFile(opts.apiUrl, app);
-          aposter = { cid: `ipfs://${p.cid}`, format: "image/jpeg" };
-          await rm(app, { force: true });
+        const pp = `${vpath}.poster.jpg`;
+        if (await makePoster(vpath, pp)) {
+          const p = await pinFile(opts.apiUrl, pp);
+          vposter = { cid: `ipfs://${p.cid}`, format: "image/jpeg" };
+          await rm(pp, { force: true });
         }
       }
-      altMobile = { cid: `ipfs://${a.cid}`, w: W, h: H, format: "video/mp4", sizeBytes: a.size, poster: aposter };
-      log(`  [${i + 1}/${withMobile.length}] + ALT 9:16 ${c.altMobileFile} → ${a.cid}`);
-    }
+      log(`  [${i + 1}/${withMobile.length}] + ${label} ${file} → ${vf.cid}`);
+      return { cid: `ipfs://${vf.cid}`, w: W, h: H, format: "video/mp4", sizeBytes: vf.size, poster: vposter };
+    };
+    const geomMobile = await pinVariant(c.geomMobileFile, "geometry 9:16");
+    const altMobile = await pinVariant(c.altMobileFile, "ALT 9:16");
 
     let captions: ClipBundleEntry["captions"];
     if (c.srt && (await exists(join(opts.clipsDir, c.srt)))) {
@@ -147,6 +154,7 @@ export async function publishClips(opts: {
       speakers: (c.speakers ?? []).map(s => s.speaker),
       mobile: { cid: `ipfs://${mobile.cid}`, w: W, h: H, format: "video/mp4", sizeBytes: mobile.size },
       poster,
+      geomMobile,
       altMobile,
       landscape,
       captions,

@@ -124,10 +124,14 @@ The captioned landscape clip above is the spine. Four layers build on it:
   `windows.json`; detection is the expensive part, composition is a pure function
   re-derived free on every run). A `director` pass (one batched LLM call) ranks
   which window each clip is *about* so the composer shows the screen the
-  conversation references, not an incidental share. A second, deliberately
-  different **ALT layout** is composed too. Tiles stack over a pre-rendered
-  slop-desktop background, captions burned on the seam. *(A geometry-log fast path
-  exists but is off by default — see Notes.)*
+  conversation references, not an incidental share. Tiles stack over a
+  pre-rendered slop-desktop background, captions burned on the seam. Up to
+  **three 9:16 takes** are cut per clip so they can be A/B'd and toggled in the
+  gallery / admin: the **CV/pixel detector** (`.mobile.mp4`, primary), the
+  **god-frame geometry detector** (`.geom.mobile.mp4`, when a geometry log covers
+  the clip — see Notes), and a deliberately-different **alt-composition**
+  (`.alt.mobile.mp4`, e.g. full-screen / swapped speakers). With the 16:9
+  landscape cut that's up to four renders per clip.
 - **Stitched clips** (`--stitch`). Lets the selector return a clip as **multiple
   spans** so a dead interjection / cross-talk in the middle can be spliced out;
   the kept duration and the cut dead-air are logged and persisted to
@@ -221,8 +225,9 @@ out/binji-x/
     01_<title>.mp4        # ranked, highest blended score first — captions burned in
     01_<title>.srt        # corrected, clip-relative
     01_<title>.ass        # the karaoke style burned into the mp4 (re-burn / re-style here)
-    01_<title>.mobile.mp4 # 9:16 stacked-tile cut (--vertical)
-    01_<title>.alt.mobile.mp4 # the ALT 9:16 take — deliberately different (--vertical)
+    01_<title>.mobile.mp4      # 9:16 — CV/pixel detector (primary, --vertical)
+    01_<title>.geom.mobile.mp4 # 9:16 — god-frame geometry detector (--vertical, when a geometry log covers the clip)
+    01_<title>.alt.mobile.mp4  # 9:16 — alt-composition: a deliberately-different VIEW (--vertical)
     02_<title>.mp4
     …
   index.json          # ranked clip metadata (pick + judge scores, critiques)

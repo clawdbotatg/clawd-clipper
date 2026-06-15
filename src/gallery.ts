@@ -49,16 +49,34 @@ export async function writeGallery(opts: {
   // query string forces a fresh load so re-renders are actually visible.
   const v = encodeURIComponent(opts.generatedAt);
 
+  // Which 9:16 framings exist across the set → which switcher buttons to show.
+  const hasV = opts.clips.some(c => c.mobileFile);
+  const hasGeom = opts.clips.some(c => c.geomMobileFile);
+  const hasAlt = opts.clips.some(c => c.altMobileFile);
+  const toggle =
+    opts.vertical && (hasV || hasGeom || hasAlt)
+      ? `<div class="toggle">
+        <button type="button" data-mode="h" class="active">🖥 16:9</button>
+        ${hasV ? `<button type="button" data-mode="v">📱 9:16 · CV</button>` : ""}
+        ${hasGeom ? `<button type="button" data-mode="geom">📱 9:16 · geometry</button>` : ""}
+        ${hasAlt ? `<button type="button" data-mode="alt">📱 9:16 · alt</button>` : ""}
+      </div>`
+      : "";
+
   const cards = opts.clips
     .map(c => {
-      // When a mobile cut exists, carry both URLs so the header toggle can swap
-      // the inline player (and the download link) between 16:9 and 9:16.
+      // Carry every available framing as data-* on the player + download link so
+      // the header switcher can flip all clips at once: 16:9 landscape (data-h),
+      // 9:16 CV (data-v), 9:16 geometry (data-geom), 9:16 alt-composition (data-alt).
       const hUrl = `clips/${esc(c.file)}?v=${v}`;
-      const vUrl = c.mobileFile ? `clips/${esc(c.mobileFile)}?v=${v}` : "";
-      const swap = vUrl ? ` data-h="${hUrl}" data-v="${vUrl}"` : "";
+      const variants: [string, string][] = [["h", hUrl]];
+      if (c.mobileFile) variants.push(["v", `clips/${esc(c.mobileFile)}?v=${v}`]);
+      if (c.geomMobileFile) variants.push(["geom", `clips/${esc(c.geomMobileFile)}?v=${v}`]);
+      if (c.altMobileFile) variants.push(["alt", `clips/${esc(c.altMobileFile)}?v=${v}`]);
+      const dataAttrs = variants.map(([k, u]) => ` data-${k}="${u}"`).join("");
       return `
     <article class="clip">
-      <div class="vid"><video controls preload="none" src="${hUrl}"${swap}></video></div>
+      <div class="vid"><video controls preload="none" src="${hUrl}"${dataAttrs}></video></div>
       <div class="meta">
         <div class="row">
           <span class="score${c.verdict === "cut" ? " cut" : ""}">${c.finalScore ?? c.score}</span>
@@ -90,7 +108,7 @@ export async function writeGallery(opts: {
             : ""
         }
         <p class="tags">${c.kind ? `<b>${esc(c.kind)}</b> · ` : ""}${c.tags.map(esc).join(" · ")}</p>
-        <p class="time">${mmss(c.start)}–${mmss(c.end)} · ${c.duration}s · <a href="${hUrl}"${swap} download>download</a> · <a href="clips/${esc(c.srt)}?v=${v}">srt</a></p>
+        <p class="time">${mmss(c.start)}–${mmss(c.end)} · ${c.duration}s · <a href="${hUrl}"${dataAttrs} download>download</a> · <a href="clips/${esc(c.srt)}?v=${v}">srt</a></p>
         ${
           c.captionText
             ? `<details><summary>captions (burned, corrected)</summary><p class="text caps">${esc(c.captionText)}</p></details>`
@@ -120,9 +138,10 @@ export async function writeGallery(opts: {
   .vid { background: #000; aspect-ratio: 16 / 9; }
   body.mobile .vid { aspect-ratio: 9 / 16; }
   .vid video { width: 100%; height: 100%; display: block; object-fit: contain; }
-  .toggle { margin-top: 10px; }
+  .toggle { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
   .toggle button { font: inherit; cursor: pointer; background: #1b1b20; color: #e8e8ea; border: 1px solid #3a3a42; border-radius: 6px; padding: 4px 11px; }
   .toggle button:hover { border-color: #7dd3fc; }
+  .toggle button.active { border-color: #7dd3fc; background: #143; color: #d6ffe8; }
   .meta { padding: 12px 14px 14px; }
   .row { display: flex; align-items: baseline; gap: 10px; }
   .row h2 { margin: 0; font-size: 14px; line-height: 1.3; }
@@ -154,7 +173,7 @@ export async function writeGallery(opts: {
 <header>
   <h1>${esc(opts.name || opts.slug)} — ${opts.clips.length} clips</h1>
   <div class="sub">slop.computer/${esc(opts.slug)} · sorted by predicted shareability · generated ${esc(opts.generatedAt)}</div>
-  ${opts.vertical ? `<div class="toggle"><button id="ar" type="button">📱 view mobile 9:16</button></div>` : ""}
+  ${toggle}
 </header>
 <main>
 ${cards}
@@ -163,17 +182,19 @@ ${
   opts.vertical
     ? `<script>
 (function () {
-  var btn = document.getElementById("ar");
-  if (!btn) return;
-  var mobile = false;
-  btn.addEventListener("click", function () {
-    mobile = !mobile;
-    document.body.classList.toggle("mobile", mobile);
-    btn.textContent = mobile ? "🖥 view landscape 16:9" : "📱 view mobile 9:16";
-    document.querySelectorAll("[data-v]").forEach(function (el) {
-      var url = mobile ? el.getAttribute("data-v") : el.getAttribute("data-h");
-      if (el.tagName === "VIDEO") { el.pause(); el.src = url; el.load(); }
-      else { el.setAttribute("href", url); }
+  var buttons = document.querySelectorAll(".toggle button[data-mode]");
+  if (!buttons.length) return;
+  buttons.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var mode = btn.getAttribute("data-mode");
+      document.body.classList.toggle("mobile", mode !== "h");
+      buttons.forEach(function (b) { b.classList.toggle("active", b === btn); });
+      // Each clip carries only the framings it has; fall back to landscape (h).
+      document.querySelectorAll("[data-h]").forEach(function (el) {
+        var url = el.getAttribute("data-" + mode) || el.getAttribute("data-h");
+        if (el.tagName === "VIDEO") { el.pause(); el.src = url; el.load(); }
+        else { el.setAttribute("href", url); }
+      });
     });
   });
 })();

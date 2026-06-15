@@ -55,8 +55,12 @@ export type Clip = ResolvedClip & {
   rank: number;
   file: string; // mp4 filename (relative to clips dir)
   srt: string; // srt filename
-  mobileFile?: string; // 9:16 mobile mp4 (relative to clips dir), when --vertical
-  altMobileFile?: string; // ALT 9:16 mobile mp4 (geometry/alt-config take), when --vertical
+  // 9:16 mobile cuts (when --vertical). Up to three, each a different framing of
+  // the same window so they can be A/B'd: the proven CV/pixel detector (primary),
+  // the god-frame geometry detector, and the deliberately-different alt-composition.
+  mobileFile?: string; // CV/pixel detector — the default 9:16
+  geomMobileFile?: string; // god-frame geometry detector (when a geometry log covered the clip)
+  altMobileFile?: string; // alt-composition — full-screen / swapped, a different VIEW (not a different detector)
 };
 
 const slugify = (s: string) =>
@@ -431,8 +435,9 @@ export async function buildClips(opts: {
   captions?: Captions; // context-corrected tokens (refine.ts); falls back to raw STT per clip
   burn?: boolean; // burn karaoke captions into the video
   vertical?: boolean; // render 9:16 mobile clips (stacked speaker tiles)
-  layouts?: Record<string, ClipLayout>; // per-clip crop boxes (clipKey -> layout), for vertical
-  altLayouts?: Record<string, ClipLayout>; // ALT 9:16 layouts (geometry/alt-config take); doubles vertical render
+  layouts?: Record<string, ClipLayout>; // CV/pixel-detector 9:16 layouts (clipKey -> layout) — the primary take
+  geomLayouts?: Record<string, ClipLayout>; // god-frame geometry 9:16 layouts (when the geometry log covered the clip)
+  altLayouts?: Record<string, ClipLayout>; // alt-composition 9:16 layouts (full-screen / swapped — a different VIEW)
   mobileBg?: string; // slop-desktop background PNG composited behind the tiles (vertical)
   limit?: number;
   log?: (m: string) => void;
@@ -520,62 +525,44 @@ export async function buildClips(opts: {
       await cutClip(clipSource, join(opts.clipsDir, file), cutStart, cutEnd);
     }
 
-    // Mobile (--vertical): a second cut into <base>.mobile.mp4 — the clip's
-    // detected windows stacked into 1080×1920 (or blur-pad when tiles are null),
-    // with captions burned on the layout's seam.
-    let mobileFile: string | undefined;
-    if (vertical) {
-      mobileFile = `${base}.mobile.mp4`;
-      const layout = opts.layouts?.[clipKey(c)];
-      const assName = `${base}.mobile.ass`;
+    // Mobile (--vertical): cut one or more 9:16 variants of the same window —
+    // each a different FRAMING so they can be A/B'd downstream: CV/pixel detector
+    // (primary, always cut — blur-pad when tiles are null), god-frame geometry,
+    // and the deliberately-different alt-composition. Same caption ASS shape, each
+    // on its own layout's seam. `always` forces the cut even without a layout (the
+    // primary degrades to blur-pad rather than vanishing).
+    const cutVertical = async (layout: ClipLayout | undefined, suffix: string, always = false): Promise<string | undefined> => {
+      if (!layout && !always) return undefined;
+      const name = `${base}${suffix}.mobile.mp4`;
+      const assName = `${base}${suffix}.mobile.ass`;
       if (burnBin)
         await writeFile(
           join(opts.clipsDir, assName),
-          buildAss(tokens, captionStart, 1080, 1920, {
-            vertical: true,
-            seamFrac: layout?.seamFrac,
-            speakerSpans: nameplateSpans,
-          }),
+          buildAss(tokens, captionStart, 1080, 1920, { vertical: true, seamFrac: layout?.seamFrac, speakerSpans: nameplateSpans }),
         );
-      await cutClipVertical(clipSource, join(opts.clipsDir, mobileFile), cutStart, cutEnd, {
+      await cutClipVertical(clipSource, join(opts.clipsDir, name), cutStart, cutEnd, {
         tiles: layout?.tiles ?? null,
         assFile: burnBin ? assName : undefined,
         bin: burnBin ?? undefined,
         cwd: opts.clipsDir,
         bgPath: opts.mobileBg,
       });
-    }
-
-    // ALT 9:16 (--vertical, when an alt layout is supplied): a SECOND mobile cut
-    // into <base>.alt.mobile.mp4 — the geometry-detector / alt-config take. This
-    // is the "double the effort, double the size" pass; it shares the caption ASS
-    // shape but on the alt layout's seam.
+      return name;
+    };
+    let mobileFile: string | undefined;
+    let geomMobileFile: string | undefined;
     let altMobileFile: string | undefined;
-    if (vertical && opts.altLayouts) {
-      const altLayout = opts.altLayouts[clipKey(c)];
-      if (altLayout) {
-        altMobileFile = `${base}.alt.mobile.mp4`;
-        const altAssName = `${base}.alt.mobile.ass`;
-        if (burnBin)
-          await writeFile(
-            join(opts.clipsDir, altAssName),
-            buildAss(tokens, captionStart, 1080, 1920, { vertical: true, seamFrac: altLayout.seamFrac, speakerSpans: nameplateSpans }),
-          );
-        await cutClipVertical(clipSource, join(opts.clipsDir, altMobileFile), cutStart, cutEnd, {
-          tiles: altLayout.tiles ?? null,
-          assFile: burnBin ? altAssName : undefined,
-          bin: burnBin ?? undefined,
-          cwd: opts.clipsDir,
-          bgPath: opts.mobileBg,
-        });
-      }
+    if (vertical) {
+      mobileFile = await cutVertical(opts.layouts?.[clipKey(c)], "", true); // CV (primary)
+      geomMobileFile = await cutVertical(opts.geomLayouts?.[clipKey(c)], ".geom"); // god-frame geometry
+      altMobileFile = await cutVertical(opts.altLayouts?.[clipKey(c)], ".alt"); // alt-composition (different view)
     }
 
     await writeFile(join(opts.clipsDir, srt), buildSrt(tokens, captionStart));
     // Drop the per-clip spliced intermediate — it's consumed by the cuts above
     // and must not linger in clipsDir (publish pins the whole dir).
     if (splicedPath) await rm(splicedPath, { force: true });
-    clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile, altMobileFile });
+    clips.push({ rank, ...c, captionText: joinTokens(tokens), file, srt, mobileFile, geomMobileFile, altMobileFile });
   }
   return clips;
 }

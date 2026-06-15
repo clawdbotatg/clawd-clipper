@@ -20,7 +20,7 @@ import {
   type LiveLine,
 } from "./speakers.js";
 import { chatReactions, fetchChat } from "./chat.js";
-import { composeLayout, detectClipWindows, labelsMatch, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
+import { composeLayout, detectClipWindows, labelsMatch, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
 import { directWindows, type Director } from "./director.js";
 import { fetchGeometryLog, logHasGodGeometry, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
@@ -355,8 +355,9 @@ async function main() {
   // those title bars into window boxes (cached in windows.json — detection is the
   // expensive part). The layout is then COMPOSED from the cached windows + the
   // clip's attributed speakers on every run (a pure function — free to retune).
-  let layouts: Record<string, ClipLayout> = {};
-  let altLayouts: Record<string, ClipLayout> = {};
+  let layouts: Record<string, ClipLayout> = {}; // CV/pixel detector — primary 9:16
+  let geomLayouts: Record<string, ClipLayout> = {}; // god-frame geometry — parallel 9:16 take
+  let altLayouts: Record<string, ClipLayout> = {}; // alt-composition — the "different view" 9:16 take
   if (args.vertical && resolvedCands.length) {
     log(`\n▸ detecting windows (9:16 mobile)…`);
     const windowsPath = join(outDir, "windows.json");
@@ -370,19 +371,17 @@ async function main() {
     }
     const size = await probeSize(source);
     // Geometry log (manifest.geometry): the relay's record of every window's
-    // exact rect over the session — the deterministic alternative to the per-clip
-    // vision/pixel detector. Fetch + decide ONCE here; reused by both the
-    // detection loop below and the ALT take further down. Two bases (see
-    // geometry.ts for the full note):
+    // exact rect over the session. It does NOT replace the CV/pixel detector —
+    // CV stays the primary 9:16 framing — geometry drives a SEPARATE geometry
+    // take (one of the parallel 9:16 variants) so the two can be A/B'd. Fetch +
+    // decide ONCE here; reused for both the geometry take and the compare tool.
+    // Two bases (see geometry.ts for the full note):
     //   • GOD-FRAME (current upstream): rects are the windows' ACTUAL rendered
     //     boxes in the OBS-capture browser + that browser's viewport, so they map
-    //     to the recorded frame with no calibration guess. Used AUTOMATICALLY (no
-    //     flag) — and the per-clip vision pass is skipped.
+    //     to the recorded frame with no calibration guess. Used AUTOMATICALLY.
     //   • LEGACY slot coords (older eps): a *different* composition from what OBS
     //     recorded — a single affine can't reconcile two cameras — so this basis
-    //     stays behind CLIPPER_USE_GEOMETRY (default off → the pixel detector,
-    //     which reads the actual recorded frame).
-    // CV remains the per-clip fallback for anything geometry can't cover.
+    //     only feeds the geometry take behind CLIPPER_USE_GEOMETRY (default off).
     const envGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
     let geomLog: GeometryLog | null = null;
     if (ep.manifest.geometry?.cid) {
@@ -390,15 +389,15 @@ async function main() {
         const fetched = await fetchGeometryLog(ep.manifest.geometry.cid);
         if (logHasGodGeometry(fetched)) {
           geomLog = fetched;
-          log(`  geometry log: ${fetched.events.length} events — god-frame rects (exact recorded geometry); using it, skipping vision`);
+          log(`  geometry log: ${fetched.events.length} events — god-frame rects (exact recorded geometry); driving the geometry 9:16 take`);
         } else if (envGeometry) {
           geomLog = fetched;
-          log(`  geometry log: ${fetched.events.length} events — legacy slot coords via CLIPPER_USE_GEOMETRY (fitted affine)`);
+          log(`  geometry log: ${fetched.events.length} events — legacy slot coords via CLIPPER_USE_GEOMETRY (fitted affine); driving the geometry 9:16 take`);
         } else {
-          log(`  geometry log present but legacy slot coords (≠ recorded composition); using pixel detector. CLIPPER_USE_GEOMETRY=1 to force.`);
+          log(`  geometry log present but legacy slot coords (≠ recorded composition); skipping the geometry take. CLIPPER_USE_GEOMETRY=1 to force it.`);
         }
       } catch (err) {
-        log(`  geometry log fetch failed, using pixels (${err instanceof Error ? err.message : err})`);
+        log(`  geometry log fetch failed, skipping the geometry take (${err instanceof Error ? err.message : err})`);
       }
     }
     const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
@@ -408,9 +407,10 @@ async function main() {
     if (!missing.length) {
       log(`  loaded cached windows`);
     } else {
-      // Geometry-log fast path: replay the log to each clip's mid-frame — no
-      // vision/pixel pass. Time anchor is the transcript offset (geometry shares
-      // its wall clock), falling back to the log header's videoStartMs.
+      // The CV/pixel detector reads each clip's mid-frame — the PRIMARY 9:16
+      // framing (proven, always runs). The geometry log, when present, drives a
+      // SEPARATE geometry take below (it doesn't replace this), so we keep both
+      // and can A/B them. Cached in windows.json.
       const framesDir = join(outDir, "frames");
       await mkdir(framesDir, { recursive: true });
       for (const c of missing) {
@@ -419,23 +419,14 @@ async function main() {
         // detect windows inside the first real span instead. (Window layout is
         // ~static per episode; this just guarantees a representative frame.)
         const det = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
-        let wins: DetectedWindow[] = [];
-        if (geomLog && geomOffsetMs != null) {
-          const midMs = ((det.start + det.end) / 2) * 1000 + geomOffsetMs;
-          wins = windowsAt(geomLog, midMs, geomNames);
-          if (wins.length) log(`  ${c.title.slice(0, 36)} — ${wins.length} windows from geometry log`);
-        }
-        if (!wins.length) {
-          wins = await detectClipWindows({
-            source,
-            framePath: join(framesDir, `${key}.png`),
-            startSec: det.start,
-            endSec: det.end,
-            participants: [...new Set(Object.values(geomNames))],
-            log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
-          });
-        }
-        windows[key] = wins;
+        windows[key] = await detectClipWindows({
+          source,
+          framePath: join(framesDir, `${key}.png`),
+          startSec: det.start,
+          endSec: det.end,
+          participants: [...new Set(Object.values(geomNames))],
+          log: m => log(`  ${c.title.slice(0, 36)} — ${m}`),
+        });
       }
       await writeFile(windowsPath, JSON.stringify(windows, null, 2));
     }
@@ -562,36 +553,33 @@ async function main() {
       log(`  ${c.title.slice(0, 36)} — ${layout.kind}${layout.speakers.length ? ` (${layout.speakers.join(" / ")})` : ""}${picks?.length ? ` · about: ${picks.join(", ")}` : ""}`);
     }
 
-    // ── ALT 9:16 layouts — a second, deliberately-different take ──────────────
-    // Composed from the SAME windows via composeLayout({alt:true}): when speaker
-    // attribution is SURE (≥70% share + camera matched) the speaker keeps the
-    // top tile and only the bottom window changes; otherwise the take swaps
-    // speakers / goes screen-full to hedge a wrong default. Reuses the geometry
-    // log + offset already decided above (god-frame automatically, or legacy slot
-    // coords only under CLIPPER_USE_GEOMETRY) — when usable it gives the ALT a
-    // genuinely different, geometry-true composition. Doubles the vertical render
-    // (opt-in downstream as the admin "ALT 9:16" button).
-    let altGeomCount = 0;
-    let altMixedCount = 0;
+    // ── Two more 9:16 takes, each a different FRAMING of the same clip ────────
+    // The primary above is the CV/pixel detector. Here we add:
+    //  • GEOMETRY take — composed from the geometry log's exact rects (when it
+    //    covered the clip). Kept separate from CV so the two detectors can be
+    //    A/B'd (yarn compare) and both shipped as toggleable takes. No geometry
+    //    (no log / off-frame) → this clip simply has no geometry take.
+    //  • ALT-COMPOSITION take — composeLayout({alt:true}) of the SAME CV windows:
+    //    when speaker attribution is SURE (≥70% share + camera matched) the
+    //    speaker keeps the top tile and only the bottom changes; otherwise it
+    //    swaps speakers / goes screen-full. NOT a different detector — a
+    //    deliberately-different VIEW (the full-screen take). Always produced.
+    // Each extra take adds a re-encoded cut per clip downstream.
+    let geomCount = 0;
     for (const c of resolvedCands) {
       const key = clipKey(c);
       const speakers = (c.speakers ?? []).slice(0, 2).map(s => s.speaker);
-      // For a stitch, the envelope midpoint lands in the dropped gap — sample the
-      // first real span instead (mirrors the primary detection above).
-      const altDet = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
-      const geomWins = geomLog && geomOffsetMs != null ? windowsAt(geomLog, ((altDet.start + altDet.end) / 2) * 1000 + geomOffsetMs, geomNames) : [];
-      let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height, composeOpts(c)) : null;
-      const def = layouts[key];
-      if (!alt || (def && layoutsSimilar(alt, def))) {
-        // No (usable) geometry take → alternate composition of the same windows.
-        alt = composeLayout(windows[key] ?? [], speakers, size.width, size.height, { ...composeOpts(c), alt: true });
-        altMixedCount++;
-      } else {
-        altGeomCount++;
+      // Geometry take: for a stitch, sample the first real span (the envelope
+      // midpoint lands in the dropped gap), mirroring the primary detection.
+      const geomDet = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
+      const geomWins = geomLog && geomOffsetMs != null ? windowsAt(geomLog, ((geomDet.start + geomDet.end) / 2) * 1000 + geomOffsetMs, geomNames) : [];
+      if (geomWins.length) {
+        geomLayouts[key] = composeLayout(geomWins, speakers, size.width, size.height, composeOpts(c));
+        geomCount++;
       }
-      altLayouts[key] = alt;
+      altLayouts[key] = composeLayout(windows[key] ?? [], speakers, size.width, size.height, { ...composeOpts(c), alt: true });
     }
-    log(`  ALT 9:16: ${altGeomCount} from geometry picks, ${altMixedCount} alt-composed (speaker pinned when attribution is sure)`);
+    log(`  9:16 takes per clip: CV primary + ${geomCount} geometry + alt-composition`);
   }
 
   // Mobile (--vertical): render the slop-desktop background once (cached), to sit
@@ -617,6 +605,7 @@ async function main() {
     burn: args.burn,
     vertical: args.vertical,
     layouts,
+    geomLayouts,
     altLayouts,
     mobileBg,
     limit: args.limit,
