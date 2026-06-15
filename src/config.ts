@@ -29,24 +29,24 @@ export const config = {
   transcribeModel: env("CLIPPER_TRANSCRIBE_MODEL") || "whisper-1",
 
   // Clip-selection model. Direct Anthropic by default; Bankr gateway fallback.
-  anthropicModel: env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
-  bankrModel: env("CLIPPER_BANKR_MODEL") || "claude-opus-4.7",
+  anthropicModel: env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",
+  bankrModel: env("CLIPPER_BANKR_MODEL") || "claude-opus-4.8",
 
   // Adversarial judge re-rank model. Defaults to the selection model; set to a
   // cheaper one (e.g. a Sonnet) to trim credits on the second-opinion pass.
-  judgeModel: env("CLIPPER_JUDGE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+  judgeModel: env("CLIPPER_JUDGE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",
 
   // Caption-correction model (refine.ts). It needs strong context-reasoning to
   // recover crypto/AI jargon + proper nouns from rough STT, so it defaults to
   // the selection model rather than a cheaper one.
-  refineModel: env("CLIPPER_REFINE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+  refineModel: env("CLIPPER_REFINE_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",
 
   // Per-clip tweet/post copy (tweets.ts). Defaults to the selection model.
-  tweetsModel: env("CLIPPER_TWEETS_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+  tweetsModel: env("CLIPPER_TWEETS_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",
 
   // 9:16 shot director (director.ts): which window the conversation is ABOUT,
   // per clip. Text-only ranking over labels — fine on a cheaper model.
-  directorModel: env("CLIPPER_DIRECTOR_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-7",
+  directorModel: env("CLIPPER_DIRECTOR_MODEL") || env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",
 
   // ffmpeg binaries. The everyday ops (probe / audio extract / plain cut) use
   // the system `ffmpeg`. Burning styled captions needs libass, which the slim

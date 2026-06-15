@@ -270,6 +270,43 @@ export function splicedCaptionTokens(words: Word[], segments: { start: number; e
 
 /** Resolve candidates to concrete time windows, dropping unanchorable / out-of-range ones.
  *  With `stitch`, a candidate's optional `segments` produce a multi-span clip. */
+/**
+ * Build a single ResolvedClip from an operator-chosen [start,end] window
+ * (absolute episode seconds) — the `--clip-at` path. Unlike resolveCandidates
+ * this does NOT anchor to a quote (the operator watched the video and has a
+ * timestamp, not verbatim words), does NOT enforce the 10-40s product bounds
+ * (the window is their call), and is never judged or de-overlapped. By default
+ * it still snaps each edge to the nearest sentence beat (within SNAP_MAX) so the
+ * cut lands clean; pass {snap:false} (`--clip-exact`) to honour the given times
+ * to the frame. Everything downstream — speaker attribution, captions, the 9:16
+ * reframe — then runs on it exactly as for an auto-picked clip.
+ */
+export function resolveManualClip(
+  transcript: Transcript,
+  spec: { start: number; end: number; title?: string },
+  opts: { snap?: boolean } = {},
+): ResolvedClip {
+  const duration = transcript.duration;
+  let s = Math.max(0, Math.min(spec.start, duration));
+  let e = Math.max(0, Math.min(spec.end, duration));
+  if (!(e > s)) throw new Error(`manual clip end (${spec.end}s) must be after start (${spec.start}s)`);
+  if (opts.snap !== false) {
+    s = Math.max(0, snapStart(transcript, s) - LEAD);
+    e = Math.min(duration, snapEnd(transcript, e) + TAIL);
+  }
+  return {
+    title: spec.title?.trim() || "custom clip",
+    reason: "manual clip — operator-specified window",
+    kind: "manual",
+    tags: [],
+    score: 100,
+    start: s,
+    end: e,
+    duration: +(e - s).toFixed(2),
+    text: wordsBetween(transcript.words, s, e),
+  };
+}
+
 export function resolveCandidates(
   candidates: RawCandidate[],
   transcript: Transcript,

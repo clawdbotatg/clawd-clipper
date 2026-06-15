@@ -1,11 +1,12 @@
 # Window Geometry Log — cross-repo spec
 
-> **Status (2026-06-07):** relay logging + finalize/manifest pin **built &
-> typechecking** in `slop-computer-live`; manifest field **carried through** in
-> `slop-computer-frontpage` and `clawd-clipper` types. **Remaining:** the
-> clipper *consumption* path (fetch → replay → feed `composeLayout`, CV
-> fallback). See "Status & what's left" at the bottom. This doc is updated to
-> describe what was actually built, which is simpler than the first draft.
+> **Status (2026-06):** fully built across both repos. The original **slot-coord**
+> basis shipped but couldn't be reconciled to the recorded frame (different
+> composition) — it's now the legacy fallback behind `CLIPPER_USE_GEOMETRY`. The
+> **god-frame** basis (the OBS browser logs each window's actual rendered rect +
+> its viewport via a `god_geometry` message) is the real fix and is used
+> automatically. See "Coordinate space" and "Status & what's left" below. Only
+> empirical end-to-end verification on a fresh recording remains.
 
 
 **Goal:** publish the exact on-screen geometry of every desktop window over the
@@ -162,19 +163,31 @@ pixels.ts path supplies only the rect (`windowBox = {x,y,w,h}`) and leaves
 
 ---
 
-## Coordinate space (the one wrinkle — still unverified)
+## Coordinate space — solved by GOD-FRAME geometry (2026-06)
 
-Slot rects are in the **shared-desktop layout** coord space the frontend renders
-in; OBS captures that browser, possibly scaled/cropped, into the recorded frame
-(typically 1920×1080). The relay does **not** know the capture viewport, so the
-header omits it — the consumer maps rects with a single affine transform:
-`scale = recordedFrame.height / layout.height` (plus an x/y offset if cropped).
-For a 1:1 capture this is identity. **This is the one genuinely open risk:**
-nobody has confirmed the capture is 1:1, so the first integration test should
-overlay a replayed rect on a real frame and read off the calibration constant.
-The visual-marker idea (a machine-readable code baked into each title bar, in
-capture pixels) remains the future option that sidesteps coordinate mapping
-entirely.
+The first cut logged the relay's **slot rects** (shared-desktop layout px) and
+hoped a single affine would map them onto the recorded frame. It didn't: the
+slot rects are in *whoever-last-moved-the-window's* viewport space (peers clamp
+to their own viewport and rebroadcast), so the log mixed coordinate spaces — a
+global affine fit IoU 0.97 *in aggregate* but couldn't reconcile two cameras at
+once (verified on `clawdbotatg`). That basis is now the **legacy fallback**,
+gated behind `CLIPPER_USE_GEOMETRY`.
+
+The fix (**Option C**): the **god-mode/OBS browser** — the exact DOM that OBS
+captures — logs each window's **actual rendered `getBoundingClientRect()`** plus
+its own viewport (`vw`/`vh`), via a `god_geometry` WS message. Because the whole
+browser is captured uniformly, a rect maps to the recorded frame as `x/vw`,
+`y/vh` — **one clean affine, no calibration constant**, and it reconciles every
+window including cameras. These lines are tagged `src:"god"` and carry `vw`/`vh`;
+the clipper prefers them per-id over any legacy slot line (see `windowsAt` in
+`src/geometry.ts`) and uses geometry automatically when they're present (no
+`CLIPPER_USE_GEOMETRY` needed). Window *visibility* still comes from the legacy
+`recordShow`/`recordHide` stream (which runs unchanged); a closed window simply
+drops out of the god snapshot.
+
+**Still empirical:** the recorded composition only exists at broadcast time, so
+the calibration (now expected to be exact) is confirmed by running a show on the
+new build and checking `yarn compare <slug>` IoU → ~1 (see below).
 
 ---
 
@@ -182,17 +195,18 @@ entirely.
 
 | Piece | Repo | Status |
 | --- | --- | --- |
-| `GeometryLog` + `DesktopState` wiring | slop-computer-live | ✅ built, typechecks |
+| `GeometryLog` + `DesktopState` slot wiring | slop-computer-live | ✅ built, typechecks |
 | finalize pin + `manifest.geometry` | slop-computer-live | ✅ built, typechecks |
 | `EpisodeManifest.geometry` carry-through | slop-computer-frontpage | ✅ done |
-| `EpisodeManifest.geometry` in clipper type | clawd-clipper | ✅ done |
-| Fetch + replay + `DetectedWindow[]` adapter | clawd-clipper | ✅ built (`src/geometry.ts`) |
-| Wire geometry-or-CV switch into `index.ts` | clawd-clipper | ✅ built |
-| Verify coordinate-space calibration on a real clip | — | ⬜ needs a recorded episode |
+| Legacy slot-coord replay (`CLIPPER_USE_GEOMETRY`) | clawd-clipper | ✅ built (`src/geometry.ts`) |
+| **God-frame producer** (`god_geometry`: `Window` `data-slot-id` + measure effect) | slop-computer-live (nextjs) | ✅ built |
+| **God-frame transport** (`god_geometry` route → `GeometryLog.recordGod`) | slop-computer-live (relay) | ✅ built |
+| **God-frame consumer** (prefer `src:"god"` rects, auto-use) | clawd-clipper | ✅ built (`src/geometry.ts`, `src/index.ts`) |
+| Verify on a real clip: `yarn compare <slug>` IoU → ~1 | — | ⬜ needs a recorded episode on the new build |
 
-The full pipeline is code-complete: the relay logs + pins `geometry.jsonl`, and
-the clipper reads it (replay verified on a synthetic log). The **only** thing
-left is empirical: run a show on the new relay build, then confirm the spatial
-calibration (layout px → frame fraction) on a real frame. Identity (1:1 at
-1920×1080) is the default; if the capture is scaled/cropped, set
-`CLIPPER_GEOM_LAYOUT_W/H` and `CLIPPER_GEOM_OFFSET_X/Y` — no code change.
+The god-frame pipeline is code-complete (replay verified on a synthetic log).
+The **only** thing left is empirical: run a show on the new relay+nextjs build so
+the god browser logs `god_geometry`, finalize pins `geometry.jsonl`, then
+`yarn clip <slug> --vertical && yarn compare <slug>` — the geometry boxes should
+snap onto the pixel boxes (mean IoU → ~1, vs the legacy basis's ~0.97-but-cameras-
+wrong). No calibration constants to set; god-frame rects are self-describing.

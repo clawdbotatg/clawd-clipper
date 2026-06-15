@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { selectCandidates, type RawCandidate } from "./candidates.js";
-import { buildClips, resolveCandidates, type StitchDiag } from "./clips.js";
+import { buildClips, resolveCandidates, resolveManualClip, type ResolvedClip, type StitchDiag } from "./clips.js";
 import { downloadFile } from "./download.js";
 import { writeGallery } from "./gallery.js";
 import { applyVerdicts, clipKey, getVerdicts, type JudgeVerdict } from "./judge.js";
@@ -22,7 +22,7 @@ import {
 import { chatReactions, fetchChat } from "./chat.js";
 import { composeLayout, detectClipWindows, labelsMatch, layoutsSimilar, type ClipLayout, type ComposeOpts, type DetectedWindow } from "./vertical.js";
 import { directWindows, type Director } from "./director.js";
-import { fetchGeometryLog, windowsAt, type GeometryLog } from "./geometry.js";
+import { fetchGeometryLog, logHasGodGeometry, windowsAt, type GeometryLog } from "./geometry.js";
 import { renderMobileBackground } from "./desktop-bg.js";
 import { publishClips } from "./publish.js";
 import { config } from "./config.js";
@@ -40,6 +40,13 @@ import { config } from "./config.js";
 //   yarn clip <slug> --vertical      render 9:16 mobile clips (stacked speaker tiles)
 //   yarn clip <slug> --stitch        allow stitched (multi-span) clips — splice out a dead interjection
 //   yarn clip <slug> --force         ignore caches (re-download, re-transcribe)
+//
+//   yarn clip <slug> --clip-at 7:18-8:05 [--clip-title "..."] [--clip-exact]
+//                                    render ONE operator-chosen window instead of mining the
+//                                    episode: skips the LLM picker / judge / tweets, runs the
+//                                    same speakers + captions + 9:16 reframe, writes nothing to
+//                                    the manifest. Implies --vertical. --clip-exact honours the
+//                                    given times to the frame (default snaps edges to a sentence beat).
 
 type Args = {
   slug: string;
@@ -54,11 +61,28 @@ type Args = {
   publish: boolean;
   stitch: boolean;
   force: boolean;
+  // --clip-at: render ONE operator-chosen window instead of mining the episode.
+  // Skips the LLM picker + judge + tweets; everything else (speakers, captions,
+  // 9:16 reframe) runs as normal. clipTitle names the file; clipSnap=false
+  // (--clip-exact) honours the given times to the frame instead of snapping.
+  clipAt?: { start: number; end: number };
+  clipTitle?: string;
+  clipSnap: boolean;
 };
+
+// Parse a clip timestamp: "M:SS", "H:MM:SS", or bare seconds ("438", "438.5").
+function parseClockTime(s: string): number {
+  const t = s.trim();
+  if (/^\d+(\.\d+)?$/.test(t)) return Number(t);
+  const parts = t.split(":");
+  if (parts.length < 2 || parts.length > 3 || parts.some(p => !/^\d+(\.\d+)?$/.test(p)))
+    throw new Error(`bad time "${s}" — use M:SS, H:MM:SS, or seconds`);
+  return parts.reduce((acc, p) => acc * 60 + Number(p), 0);
+}
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false, stitch: false };
+  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false, stitch: false, clipSnap: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
@@ -72,13 +96,25 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--manifest") out.manifest = argv[++i];
     else if (a === "--limit") out.limit = Number(argv[++i]);
     else if (a === "--target") out.target = Number(argv[++i]);
+    else if (a === "--clip-at") {
+      // ONE custom clip from an explicit window: "M:SS-M:SS" (or seconds-seconds).
+      const spec = argv[++i] ?? "";
+      const m = spec.match(/^(.+?)\s*-\s*(.+)$/);
+      if (!m) throw new Error(`--clip-at wants START-END (e.g. 7:18-8:05), got "${spec}"`);
+      out.clipAt = { start: parseClockTime(m[1]!), end: parseClockTime(m[2]!) };
+    } else if (a === "--clip-title") out.clipTitle = argv[++i];
+    else if (a === "--clip-exact") out.clipSnap = false; // honour times to the frame (no sentence-beat snap)
     else if (a.startsWith("--")) throw new Error(`unknown flag: ${a}`);
     else positional.push(a);
   }
   if (!positional[0])
     throw new Error(
-      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--stitch] [--force]",
+      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--stitch] [--force]\n" +
+        "       yarn clip <slug> --clip-at 7:18-8:05 [--clip-title \"...\"] [--clip-exact]   # render ONE custom clip from an explicit window",
     );
+  // A custom clip is a 9:16 reframe by definition (geometry + speaker tile is the
+  // whole point), so --clip-at implies --vertical.
+  if (out.clipAt) out.vertical = true;
   return {
     slug: positional[0],
     ...out,
@@ -90,6 +126,7 @@ function parseArgs(argv: string[]): Args {
     publish: out.publish ?? false,
     stitch: out.stitch ?? false,
     force: out.force ?? false,
+    clipSnap: out.clipSnap ?? true,
   };
 }
 
@@ -158,54 +195,68 @@ async function main() {
     }
   }
 
-  log(`\n▸ selecting clip candidates…`);
-  // Cache the LLM's raw candidates so re-runs (tweaking padding, captions,
-  // gallery) are free + deterministic. --force re-asks the model.
-  const candPath = join(outDir, "candidates.json");
-  let candidates: RawCandidate[] | null = null;
-  if (!args.force) {
-    try {
-      candidates = JSON.parse(await readFile(candPath, "utf8")) as RawCandidate[];
-      log(`  loaded ${candidates.length} cached candidates`);
-    } catch {
-      /* no cache */
-    }
-  }
-  if (!candidates) {
-    candidates = await selectCandidates({
-      transcript,
-      meta: ep.manifest.meta,
-      targetSeconds: args.target,
-      context: { speakerLabels, chatReactions: chatBlock, research, stitch: args.stitch },
-    });
-    await writeFile(candPath, JSON.stringify(candidates, null, 2));
-    log(`  model proposed ${candidates.length} candidates`);
-  }
-
-  // Stitch decisions are logged AND persisted to out/<slug>/stitches.json so a
-  // later inspection can see exactly what the model tried, what got spliced
-  // (which spans, how much dead air was cut), and why any attempt was dropped.
-  const stitchDiags: StitchDiag[] = [];
-  let resolvedCands = resolveCandidates(candidates, transcript, {
-    stitch: args.stitch,
-    onStitch: d => {
-      stitchDiags.push(d);
-      if (d.resolved) {
-        const cut = (d.cutSec ?? []).reduce((a, b) => a + b, 0);
-        log(`  stitch ✓ "${d.title}" — ${d.segments!.length} spans, kept ${d.durationSec}s, cut ${cut.toFixed(1)}s of dead air`);
-      } else {
-        log(`  stitch ✗ "${d.title}" — dropped: ${d.reason}`);
+  let resolvedCands: ResolvedClip[];
+  if (args.clipAt) {
+    // ── Custom clip (--clip-at) ──────────────────────────────────────────────
+    // Skip the LLM picker, stitch and judge entirely: the operator watched the
+    // episode and chose this exact window. We build a single clip from it and
+    // let the rest of the pipeline (speakers, captions, 9:16 reframe) run on it
+    // unchanged. Nothing is published or folded into the manifest.
+    const { start, end } = args.clipAt;
+    const clip = resolveManualClip(transcript, { start, end, title: args.clipTitle }, { snap: args.clipSnap });
+    resolvedCands = [clip];
+    const fmt = (s: number) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
+    log(`\n▸ custom clip: ${fmt(clip.start)}–${fmt(clip.end)} (${clip.duration}s${args.clipSnap ? ", snapped to sentence beats" : ", exact times"}) — "${clip.title}"`);
+  } else {
+    log(`\n▸ selecting clip candidates…`);
+    // Cache the LLM's raw candidates so re-runs (tweaking padding, captions,
+    // gallery) are free + deterministic. --force re-asks the model.
+    const candPath = join(outDir, "candidates.json");
+    let candidates: RawCandidate[] | null = null;
+    if (!args.force) {
+      try {
+        candidates = JSON.parse(await readFile(candPath, "utf8")) as RawCandidate[];
+        log(`  loaded ${candidates.length} cached candidates`);
+      } catch {
+        /* no cache */
       }
-    },
-  });
-  const stitched = resolvedCands.filter(c => c.segments?.length).length;
-  log(
-    `  ${resolvedCands.length} anchored to real timestamps + in range` +
-      (args.stitch ? ` · stitches: ${stitched} kept, ${stitchDiags.length - stitched} dropped (see out/${args.slug}/stitches.json)` : ""),
-  );
-  if (args.stitch) await writeFile(join(outDir, "stitches.json"), JSON.stringify(stitchDiags, null, 2));
+    }
+    if (!candidates) {
+      candidates = await selectCandidates({
+        transcript,
+        meta: ep.manifest.meta,
+        targetSeconds: args.target,
+        context: { speakerLabels, chatReactions: chatBlock, research, stitch: args.stitch },
+      });
+      await writeFile(candPath, JSON.stringify(candidates, null, 2));
+      log(`  model proposed ${candidates.length} candidates`);
+    }
 
-  if (args.judge && resolvedCands.length) {
+    // Stitch decisions are logged AND persisted to out/<slug>/stitches.json so a
+    // later inspection can see exactly what the model tried, what got spliced
+    // (which spans, how much dead air was cut), and why any attempt was dropped.
+    const stitchDiags: StitchDiag[] = [];
+    resolvedCands = resolveCandidates(candidates, transcript, {
+      stitch: args.stitch,
+      onStitch: d => {
+        stitchDiags.push(d);
+        if (d.resolved) {
+          const cut = (d.cutSec ?? []).reduce((a, b) => a + b, 0);
+          log(`  stitch ✓ "${d.title}" — ${d.segments!.length} spans, kept ${d.durationSec}s, cut ${cut.toFixed(1)}s of dead air`);
+        } else {
+          log(`  stitch ✗ "${d.title}" — dropped: ${d.reason}`);
+        }
+      },
+    });
+    const stitched = resolvedCands.filter(c => c.segments?.length).length;
+    log(
+      `  ${resolvedCands.length} anchored to real timestamps + in range` +
+        (args.stitch ? ` · stitches: ${stitched} kept, ${stitchDiags.length - stitched} dropped (see out/${args.slug}/stitches.json)` : ""),
+    );
+    if (args.stitch) await writeFile(join(outDir, "stitches.json"), JSON.stringify(stitchDiags, null, 2));
+  }
+
+  if (args.judge && !args.clipAt && resolvedCands.length) {
     log(`\n▸ adversarial judge re-rank…`);
     // Cache verdicts keyed by clip content (judge.json) so re-runs are free.
     const judgePath = join(outDir, "judge.json");
@@ -278,7 +329,7 @@ async function main() {
   // Suggested post copy (short + long tweet) per clip, ready to ship with the
   // video. Uses the corrected caption text + the judge's critique (so the copy
   // supplies the hook the clip lacks cold). Cached (tweets.json) by clip content.
-  if (args.tweets && resolvedCands.length) {
+  if (args.tweets && !args.clipAt && resolvedCands.length) {
     log(`\n▸ drafting post copy…`);
     const tweetPath = join(outDir, "tweets.json");
     let tweets: Tweets = {};
@@ -318,40 +369,48 @@ async function main() {
       }
     }
     const size = await probeSize(source);
-    // OPT-IN geometry: the geometry log records the relay's interactive
-    // god-desktop slot positions, but the OBS-recorded video is a *different*
-    // composition (windows re-arranged / clamped at the broadcast viewport), so
-    // replayed rects don't line up with the recorded pixels — verified on
-    // clawdbotatg: two cameras can't be reconciled by a single affine. Until the
-    // upstream logs the BROADCAST composition's coords (not the slot coords),
-    // default to the pixel detector, which reads the actual recorded frame. Set
-    // CLIPPER_USE_GEOMETRY=1 to re-enable once that calibration is solved.
-    // (Gates BOTH the default detection below and the ALT take further down —
-    // the ALT used to consume the misaligned log unconditionally.)
-    const useGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
+    // Geometry log (manifest.geometry): the relay's record of every window's
+    // exact rect over the session — the deterministic alternative to the per-clip
+    // vision/pixel detector. Fetch + decide ONCE here; reused by both the
+    // detection loop below and the ALT take further down. Two bases (see
+    // geometry.ts for the full note):
+    //   • GOD-FRAME (current upstream): rects are the windows' ACTUAL rendered
+    //     boxes in the OBS-capture browser + that browser's viewport, so they map
+    //     to the recorded frame with no calibration guess. Used AUTOMATICALLY (no
+    //     flag) — and the per-clip vision pass is skipped.
+    //   • LEGACY slot coords (older eps): a *different* composition from what OBS
+    //     recorded — a single affine can't reconcile two cameras — so this basis
+    //     stays behind CLIPPER_USE_GEOMETRY (default off → the pixel detector,
+    //     which reads the actual recorded frame).
+    // CV remains the per-clip fallback for anything geometry can't cover.
+    const envGeometry = /^(1|true|yes)$/i.test(process.env.CLIPPER_USE_GEOMETRY ?? "");
+    let geomLog: GeometryLog | null = null;
+    if (ep.manifest.geometry?.cid) {
+      try {
+        const fetched = await fetchGeometryLog(ep.manifest.geometry.cid);
+        if (logHasGodGeometry(fetched)) {
+          geomLog = fetched;
+          log(`  geometry log: ${fetched.events.length} events — god-frame rects (exact recorded geometry); using it, skipping vision`);
+        } else if (envGeometry) {
+          geomLog = fetched;
+          log(`  geometry log: ${fetched.events.length} events — legacy slot coords via CLIPPER_USE_GEOMETRY (fitted affine)`);
+        } else {
+          log(`  geometry log present but legacy slot coords (≠ recorded composition); using pixel detector. CLIPPER_USE_GEOMETRY=1 to force.`);
+        }
+      } catch (err) {
+        log(`  geometry log fetch failed, using pixels (${err instanceof Error ? err.message : err})`);
+      }
+    }
+    const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
+    const geomNames = namesFromParticipants(ep.manifest.participants);
+
     const missing = resolvedCands.filter(c => !windows[clipKey(c)]);
     if (!missing.length) {
       log(`  loaded cached windows`);
     } else {
-      // Geometry-log fast path: if the relay logged exact window rects, replay
-      // them to each clip's mid-frame — no vision/pixel pass. Time anchor is the
-      // offset recovered from the transcript (geometry shares its wall clock),
-      // falling back to the log header's videoStartMs. CV stays the per-clip
-      // fallback for anything the log can't cover (gaps, off-frame, older eps).
-      let geomLog: GeometryLog | null = null;
-      if (useGeometry && ep.manifest.geometry?.cid) {
-        try {
-          geomLog = await fetchGeometryLog(ep.manifest.geometry.cid);
-          log(`  geometry log: ${geomLog.events.length} events (manifest.geometry, CLIPPER_USE_GEOMETRY)`);
-        } catch (err) {
-          log(`  geometry log fetch failed, using pixels (${err instanceof Error ? err.message : err})`);
-        }
-      } else if (ep.manifest.geometry?.cid) {
-        log(`  geometry log present but disabled (recording composition ≠ slot coords); using pixel detector. CLIPPER_USE_GEOMETRY=1 to override.`);
-      }
-      const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
-      const geomNames = namesFromParticipants(ep.manifest.participants);
-
+      // Geometry-log fast path: replay the log to each clip's mid-frame — no
+      // vision/pixel pass. Time anchor is the transcript offset (geometry shares
+      // its wall clock), falling back to the log header's videoStartMs.
       const framesDir = join(outDir, "frames");
       await mkdir(framesDir, { recursive: true });
       for (const c of missing) {
@@ -507,21 +566,11 @@ async function main() {
     // Composed from the SAME windows via composeLayout({alt:true}): when speaker
     // attribution is SURE (≥70% share + camera matched) the speaker keeps the
     // top tile and only the bottom window changes; otherwise the take swaps
-    // speakers / goes screen-full to hedge a wrong default. The geometry-log
-    // detector only feeds this when CLIPPER_USE_GEOMETRY=1 (its slot coords
-    // don't match the recorded composition — see the note above; it used to run
-    // here ungated, producing misaligned ALT crops). Doubles the vertical render
+    // speakers / goes screen-full to hedge a wrong default. Reuses the geometry
+    // log + offset already decided above (god-frame automatically, or legacy slot
+    // coords only under CLIPPER_USE_GEOMETRY) — when usable it gives the ALT a
+    // genuinely different, geometry-true composition. Doubles the vertical render
     // (opt-in downstream as the admin "ALT 9:16" button).
-    let altGeom: GeometryLog | null = null;
-    if (useGeometry && ep.manifest.geometry?.cid) {
-      try {
-        altGeom = await fetchGeometryLog(ep.manifest.geometry.cid);
-      } catch (err) {
-        log(`  alt: geometry log fetch failed, using alt-config of pixel windows (${err instanceof Error ? err.message : err})`);
-      }
-    }
-    const altOffsetMs = alignOffsetMs ?? altGeom?.videoStartMs ?? null;
-    const altNames = namesFromParticipants(ep.manifest.participants);
     let altGeomCount = 0;
     let altMixedCount = 0;
     for (const c of resolvedCands) {
@@ -530,7 +579,7 @@ async function main() {
       // For a stitch, the envelope midpoint lands in the dropped gap — sample the
       // first real span instead (mirrors the primary detection above).
       const altDet = c.segments?.length ? c.segments[0]! : { start: c.start, end: c.end };
-      const geomWins = altGeom && altOffsetMs != null ? windowsAt(altGeom, ((altDet.start + altDet.end) / 2) * 1000 + altOffsetMs, altNames) : [];
+      const geomWins = geomLog && geomOffsetMs != null ? windowsAt(geomLog, ((altDet.start + altDet.end) / 2) * 1000 + geomOffsetMs, geomNames) : [];
       let alt = geomWins.length ? composeLayout(geomWins, speakers, size.width, size.height, composeOpts(c)) : null;
       const def = layouts[key];
       if (!alt || (def && layoutsSimilar(alt, def))) {
@@ -556,11 +605,14 @@ async function main() {
   }
 
   log(`\n▸ cutting clips…`);
+  // A custom clip renders into its own out/<slug>/custom/ dir so it never
+  // clobbers the auto-generated gallery (out/<slug>/clips + index.{json,html}).
+  const clipsDir = join(outDir, args.clipAt ? "custom" : "clips");
   const clips = await buildClips({
     source,
     transcript,
     resolved: resolvedCands,
-    clipsDir: join(outDir, "clips"),
+    clipsDir,
     captions,
     burn: args.burn,
     vertical: args.vertical,
@@ -599,6 +651,33 @@ async function main() {
   }
 
   const generatedAt = new Date(t0).toISOString();
+
+  if (args.clipAt) {
+    // Custom clip: don't touch the gallery or the manifest — just emit a small
+    // descriptor of what was rendered so the relay's /admin/clip-at route can
+    // find + serve the file back to the admin (paths are relative to out/<slug>).
+    const c = clips[0];
+    const descriptor = {
+      slug: args.slug,
+      title: c?.title ?? args.clipTitle ?? "custom clip",
+      start: c?.start ?? args.clipAt.start,
+      end: c?.end ?? args.clipAt.end,
+      duration: c?.duration,
+      dir: "custom",
+      file: c?.file, // landscape mp4 (clips-dir-relative)
+      mobileFile: c?.mobileFile, // 9:16 stacked-tile mp4
+      altMobileFile: c?.altMobileFile, // the ALT 9:16 take
+      srt: c?.srt,
+      speaker: c?.speaker,
+      generatedAt,
+    };
+    await writeFile(join(outDir, "custom-clip.json"), JSON.stringify(descriptor, null, 2));
+    log(`\n✓ custom clip in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+    log(`  ${join(clipsDir, c?.mobileFile ?? c?.file ?? "")}`);
+    log(`  descriptor: ${join(outDir, "custom-clip.json")}`);
+    return;
+  }
+
   await writeGallery({
     outDir,
     slug: args.slug,

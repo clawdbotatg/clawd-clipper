@@ -18,19 +18,25 @@ import type { DetectedWindow, WinKind } from "./vertical.js";
 //    capture/receive skew — more reliable than the filename-parsed videoStartMs,
 //    which we keep only as a fallback when transcript alignment isn't available.
 //
-//  • SPACE — slot rects are in the slop desktop LAYOUT coord space (CSS px of the
-//    shared-desktop canvas). OBS captures that canvas into the recorded frame.
-//    We map layout px → frame fraction with one affine transform.
+//  • SPACE — two bases, picked per entry by windowsAt():
 //
-//    CALIBRATED 2026-06-08 on `clawdbotatg`: the recorded frame is 1920×1080 but
-//    the layout space is ~1717×960 (the broadcast viewport the relay lays out in
-//    is smaller than the OBS canvas, so the capture is scaled ~1.12×, not 1:1).
-//    Fit from 29 matched geometry↔pixel window pairs across 12 clips — scale
-//    X=1.118, Y=1.125, offset ≈0, sd ≈0.01 — i.e. a single global affine, dead
-//    consistent. With these defaults `yarn compare clawdbotatg` reports mean
-//    IoU 0.97 (was 0.50 at identity 1920×1080). If the OBS/broadcast capture
-//    setup changes, re-fit with `yarn compare <slug>` and update these four (all
-//    env-overridable: CLIPPER_GEOM_LAYOUT_W/H, CLIPPER_GEOM_OFFSET_X/Y).
+//    GOD-FRAME (src:"god", the current upstream): each window's rect is the
+//    ACTUAL rendered box in the OBS-capture browser, logged with that browser's
+//    viewport (vw/vh). The whole browser is captured uniformly, so frame fraction
+//    is just x/vw, y/vh — one clean affine, no calibration constant, and it
+//    reconciles every window (cameras included). This is the fix for the failure
+//    the LEGACY basis below hit. logHasGodGeometry() detects it; index.ts then
+//    uses geometry automatically (no CLIPPER_USE_GEOMETRY needed).
+//
+//    LEGACY (slot-px, older episodes): rects are the relay's interactive
+//    god-desktop SLOT coords, in whoever-last-moved-the-window's viewport px —
+//    a different composition from what OBS recorded. We map them with a single
+//    fitted affine (LAYOUT_W/H below): CALIBRATED 2026-06-08 on `clawdbotatg` to
+//    ~1717×960 (scale ≈1.12), mean IoU 0.97 in aggregate — but it can't reconcile
+//    two cameras at once (their slot rects live in different viewport spaces), so
+//    this basis stays gated behind CLIPPER_USE_GEOMETRY. Re-fit with
+//    `yarn compare <slug>`; all four are env-overridable
+//    (CLIPPER_GEOM_LAYOUT_W/H, CLIPPER_GEOM_OFFSET_X/Y).
 
 const LAYOUT_W = Number(process.env.CLIPPER_GEOM_LAYOUT_W) || 1717;
 const LAYOUT_H = Number(process.env.CLIPPER_GEOM_LAYOUT_H) || 960;
@@ -47,6 +53,13 @@ type GeomEvent = {
   z?: number;
   shown?: boolean;
   removed?: boolean;
+  // GOD-FRAME basis (src:"god"): x/y/w/h are the window's actual rendered rect in
+  // the OBS-capture browser, in that browser's CSS px, and vw/vh is that browser's
+  // viewport. Recorded-frame fraction is then x/vw, y/vh — one clean affine, no
+  // calibration guess. Absent ⇒ legacy slot-px basis (the LAYOUT_W/H affine).
+  vw?: number;
+  vh?: number;
+  src?: string;
 };
 
 export type GeometryLog = {
@@ -107,11 +120,20 @@ function parseSlotId(id: string): { ownerKey: string; kind: WinKind } | null {
  * `shown` makes a slot visible, `removed` hides it. Windows are returned topmost
  * (highest z) first so composeLayout's `cams[0]` fallback picks the frontmost.
  *
+ * A new episode interleaves TWO geom streams on the same log: the legacy
+ * slot-coord lines (recordMove/Show) and the god-frame lines (src:"god", with
+ * vw/vh). We keep them in SEPARATE maps and always PREFER the god rect per id —
+ * so an interleaved slot line can never clobber the correct rendered rect,
+ * regardless of write order. Legacy slot geom is the fallback for ids the god
+ * stream never covered (older eps, or windows off the captured frame).
+ *
  * `names` resolves ownerKey → handle (from manifest.participants) so the label
  * feeds composeLayout's speaker↔camera matching with zero fuzzy guessing.
  */
 export function windowsAt(log: GeometryLog, tWallMs: number, names: Record<string, string> = {}): DetectedWindow[] {
-  const geom = new Map<string, { x: number; y: number; w: number; h: number; z: number }>();
+  type G = { x: number; y: number; w: number; h: number; z: number; vw?: number; vh?: number };
+  const godGeom = new Map<string, G>();
+  const legacyGeom = new Map<string, G>();
   const visible = new Map<string, boolean>();
   for (const e of log.events) {
     if (e.ts > tWallMs) break; // events are sorted ascending
@@ -121,7 +143,12 @@ export function windowsAt(log: GeometryLog, tWallMs: number, names: Record<strin
       typeof e.w === "number" &&
       typeof e.h === "number"
     ) {
-      geom.set(e.id, { x: e.x, y: e.y, w: e.w, h: e.h, z: typeof e.z === "number" ? e.z : 0 });
+      const z = typeof e.z === "number" ? e.z : 0;
+      if (typeof e.vw === "number" && e.vw > 0 && typeof e.vh === "number" && e.vh > 0) {
+        godGeom.set(e.id, { x: e.x, y: e.y, w: e.w, h: e.h, z, vw: e.vw, vh: e.vh });
+      } else {
+        legacyGeom.set(e.id, { x: e.x, y: e.y, w: e.w, h: e.h, z });
+      }
     }
     if (e.shown) visible.set(e.id, true);
     if (e.removed) visible.set(e.id, false);
@@ -130,15 +157,25 @@ export function windowsAt(log: GeometryLog, tWallMs: number, names: Record<strin
   const rows: { win: DetectedWindow; z: number }[] = [];
   for (const [id, vis] of visible) {
     if (!vis) continue;
-    const g = geom.get(id);
+    const g = godGeom.get(id) ?? legacyGeom.get(id);
     if (!g) continue;
     const parsed = parseSlotId(id);
     if (!parsed) continue;
-    // layout px → frame fraction (the one calibration; identity by default).
-    const x = (g.x - OFFSET_X) / LAYOUT_W;
-    const y = (g.y - OFFSET_Y) / LAYOUT_H;
-    const w = g.w / LAYOUT_W;
-    const h = g.h / LAYOUT_H;
+    // → frame fraction. GOD-FRAME entries (carry their own capture viewport)
+    // normalize by it directly — one clean affine, no calibration guess. Legacy
+    // slot-px entries fall back to the fitted LAYOUT_W/H affine.
+    let x: number, y: number, w: number, h: number;
+    if (g.vw && g.vh) {
+      x = g.x / g.vw;
+      y = g.y / g.vh;
+      w = g.w / g.vw;
+      h = g.h / g.vh;
+    } else {
+      x = (g.x - OFFSET_X) / LAYOUT_W;
+      y = (g.y - OFFSET_Y) / LAYOUT_H;
+      w = g.w / LAYOUT_W;
+      h = g.h / LAYOUT_H;
+    }
     if (!(w > 0 && h > 0)) continue;
     if (x >= 1 || y >= 1 || x + w <= 0 || y + h <= 0) continue; // fully off-frame
     const label = names[parsed.ownerKey.toLowerCase()] ?? parsed.ownerKey;
@@ -146,4 +183,13 @@ export function windowsAt(log: GeometryLog, tWallMs: number, names: Record<strin
   }
   rows.sort((a, b) => b.z - a.z);
   return rows.map(r => r.win);
+}
+
+/** Does the log carry GOD-FRAME geometry — windows measured as their actual
+ *  rendered rect in the OBS-capture browser (src:"god", carrying vw/vh)? These
+ *  map to the recorded frame with no calibration guess, so the clipper trusts
+ *  them automatically (vs. the legacy slot-px basis, which is gated behind
+ *  CLIPPER_USE_GEOMETRY because its single-affine fit can't reconcile cameras). */
+export function logHasGodGeometry(log: GeometryLog): boolean {
+  return log.events.some(e => e.src === "god" && typeof e.vw === "number" && typeof e.vh === "number");
 }
