@@ -8,7 +8,7 @@ import { applyVerdicts, clipKey, getVerdicts, type JudgeVerdict } from "./judge.
 import { refineCaptions, type Captions } from "./refine.js";
 import { applyTweets, generateTweets, type Tweets } from "./tweets.js";
 import { resolveBySlug, resolveByManifestCid, type ResolvedEpisode } from "./resolve.js";
-import { transcribeVideo } from "./transcribe.js";
+import { transcribeVideo, transcribeWindow } from "./transcribe.js";
 import { probeSize } from "./ffmpeg.js";
 import {
   alignToVideo,
@@ -207,6 +207,33 @@ async function main() {
     resolvedCands = [clip];
     const fmt = (s: number) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
     log(`\n▸ custom clip: ${fmt(clip.start)}–${fmt(clip.end)} (${clip.duration}s${args.clipSnap ? ", snapped to sentence beats" : ", exact times"}) — "${clip.title}"`);
+
+    // The full-episode whisper decode can hallucinate a repeat-loop over a stretch
+    // of audio — shafu0x's 7:23–8:05 came back as "A film by A film by…", which
+    // burned garbage captions. Re-transcribe THIS clip's own audio window and
+    // splice the accurate words/segments over that region so captions match the
+    // actual speech. Best-effort: on failure we keep the full-episode transcript.
+    try {
+      log(`\n▸ re-transcribing the clip window for accurate captions…`);
+      const fresh = await transcribeWindow({ videoFile: source, workDir: outDir, start: clip.start, end: clip.end, log: m => log(`  ${m}`) });
+      if (fresh.words.length) {
+        const outside = (s: number, e: number) => e <= clip.start + 0.02 || s >= clip.end - 0.02;
+        transcript.words = [...transcript.words.filter(w => outside(w.start, w.end)), ...fresh.words].sort((a, b) => a.start - b.start);
+        transcript.segments = [...transcript.segments.filter(s => outside(s.start, s.end)), ...fresh.segments].sort((a, b) => a.start - b.start);
+        // Re-derive the clip's text (and thus its content-hash clipKey) from the
+        // corrected words so the caption + cache keys line up with what's burned in.
+        clip.text = fresh.words
+          .map(w => w.word.trim())
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .replace(/\s+([,.!?;:%)\]}…])/g, "$1")
+          .trim();
+      } else {
+        log(`  (no words returned — keeping full-episode transcript)`);
+      }
+    } catch (err) {
+      log(`  window re-transcribe failed (${err instanceof Error ? err.message : err}); using full-episode transcript`);
+    }
   } else {
     log(`\n▸ selecting clip candidates…`);
     // Cache the LLM's raw candidates so re-runs (tweaking padding, captions,

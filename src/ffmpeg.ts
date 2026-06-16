@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { config } from "./config.js";
 
 // Thin wrappers over the system ffmpeg / ffprobe. Everything the clipper does
@@ -96,6 +96,34 @@ export async function extractAudioSegments(
     offset += await probeDuration(path);
   }
   return out;
+}
+
+/**
+ * Extract a single [start,end] audio window as mono 16 kHz mp3 — for
+ * re-transcribing one clip's own audio (custom clips), independent of the
+ * full-episode transcript (which whisper can hallucinate a repeat-loop over).
+ */
+export async function extractAudioWindow(videoFile: string, start: number, end: number, outPath: string): Promise<void> {
+  await mkdir(dirname(outPath), { recursive: true });
+  await run("ffmpeg", [
+    "-y",
+    "-ss",
+    String(Math.max(0, start)),
+    "-to",
+    String(end),
+    "-i",
+    videoFile,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-b:a",
+    "64k",
+    "-loglevel",
+    "error",
+    outPath,
+  ]);
 }
 
 /** Pixel dimensions of a video's first video stream. */

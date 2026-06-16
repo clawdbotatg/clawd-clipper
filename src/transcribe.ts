@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import OpenAI from "openai";
 import { config } from "./config.js";
-import { extractAudioSegments, probeDuration } from "./ffmpeg.js";
+import { extractAudioSegments, extractAudioWindow, probeDuration } from "./ffmpeg.js";
 
 // Word-accurate transcription of the finished video. We re-transcribe the
 // downloaded mp4 (rather than reuse the live in-browser transcript) so cut
@@ -84,4 +84,39 @@ export async function transcribeVideo(opts: {
   await writeFile(opts.cachePath, JSON.stringify(transcript));
   log(`transcript: ${words.length} words, ${segments.length} segments, ${duration.toFixed(0)}s`);
   return transcript;
+}
+
+/**
+ * Re-transcribe ONE [start,end] audio window on its own — for custom clips
+ * (`--clip-at`). The full-episode decode can hallucinate a repeat-loop over a
+ * stretch of audio (shafu0x 7:23–8:05 came back as "A film by A film by…"),
+ * which would burn garbage captions. A fresh decode of just the window is clean.
+ *
+ * We transcribe a little PAST `end` (contextTail) so a word cut at the clip
+ * boundary has trailing context and doesn't itself trigger a loop, then discard
+ * anything beginning at/after `end`. Returned times are absolute (episode) sec.
+ */
+export async function transcribeWindow(opts: {
+  videoFile: string;
+  workDir: string;
+  start: number;
+  end: number;
+  contextTail?: number;
+  log?: (m: string) => void;
+}): Promise<{ words: Word[]; segments: Segment[] }> {
+  const log = opts.log ?? (() => {});
+  const tail = opts.contextTail ?? 3;
+  const audioPath = join(opts.workDir, "audio", `window-${Math.round(opts.start)}-${Math.round(opts.end)}.mp3`);
+  await extractAudioWindow(opts.videoFile, opts.start, opts.end + tail, audioPath);
+  const r = await transcribeChunk(audioPath);
+  // whisper times are relative to the extract start (opts.start) → shift to
+  // absolute, and drop anything that begins in the discarded +contextTail.
+  const words: Word[] = (r.words ?? [])
+    .map(w => ({ start: w.start + opts.start, end: w.end + opts.start, word: w.word }))
+    .filter(w => w.start < opts.end - 0.02);
+  const segments: Segment[] = (r.segments ?? [])
+    .map(s => ({ start: s.start + opts.start, end: s.end + opts.start, text: s.text.trim() }))
+    .filter(s => s.start < opts.end - 0.02);
+  log(`re-transcribed window: ${words.length} words`);
+  return { words, segments };
 }
