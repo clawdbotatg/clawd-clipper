@@ -27,6 +27,14 @@ export const config = {
   // whisper-1 is the only OpenAI model that returns word-level timestamps
   // (verbose_json + timestamp_granularities). gpt-4o-transcribe does not.
   transcribeModel: env("CLIPPER_TRANSCRIBE_MODEL") || "whisper-1",
+  // Audio chunk length (s) for transcription. whisper-1 decodes autoregressively
+  // with condition_on_previous_text ON (and the API won't let us disable it), so
+  // a repeat-loop hallucination ("a film by a film by…") SELF-REINFORCES across a
+  // long chunk — a single 10-min chunk turned 6.5 min of shafu0x into garbage the
+  // selector was blind to. Short chunks reset that context so a loop can't
+  // propagate; 120s recovered the lot (0 loops vs 173). Tradeoff: more API calls +
+  // less cross-chunk context, both acceptable next to losing whole segments.
+  transcribeChunkSec: Number(env("CLIPPER_TRANSCRIBE_CHUNK_SEC")) || 120,
 
   // Clip-selection model. Direct Anthropic by default; Bankr gateway fallback.
   anthropicModel: env("CLIPPER_ANTHROPIC_MODEL") || "claude-opus-4-8",

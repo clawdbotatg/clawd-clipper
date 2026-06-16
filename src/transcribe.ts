@@ -57,8 +57,8 @@ export async function transcribeVideo(opts: {
   }
 
   const audioDir = join(opts.workDir, "audio");
-  log("extracting + segmenting audio…");
-  const chunks = await extractAudioSegments(opts.videoFile, audioDir);
+  log(`extracting + segmenting audio (${config.transcribeChunkSec}s chunks)…`);
+  const chunks = await extractAudioSegments(opts.videoFile, audioDir, config.transcribeChunkSec);
   log(`transcribing ${chunks.length} chunk(s) with ${config.transcribeModel}…`);
 
   const words: Word[] = [];
