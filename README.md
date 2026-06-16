@@ -239,6 +239,9 @@ out/binji-x/
 - **Cost / time.** Dominated by the 3 GB download and whisper-1 (~$0.006/min of
   audio). Both are cached, so re-running selection/cutting is cheap — only
   `--force` re-does them.
+- **Prod disk getting tight?** Cached sources + raw recordings add up on the
+  box. Expand the EBS volume (cheap, online) or prune old artifacts — runbook:
+  [`docs/disk-cleanup-runbook.md`](docs/disk-cleanup-runbook.md).
 - **Clip bounds** live at the top of `src/clips.ts` (`MIN`/`MAX`/`LEAD`/`TAIL`,
   overlap threshold).
 - **Caption look** (font, size via `CLIPPER_CAPTION_SCALE`, the purple / white /
