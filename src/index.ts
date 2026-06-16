@@ -430,7 +430,14 @@ async function main() {
     const geomOffsetMs = alignOffsetMs ?? geomLog?.videoStartMs ?? null;
     const geomNames = namesFromParticipants(ep.manifest.participants);
 
-    const missing = resolvedCands.filter(c => !windows[clipKey(c)]);
+    // Custom clips ALWAYS re-detect their windows. The windows cache is keyed by
+    // clip TEXT (clipKey), but window GEOMETRY is a function of TIME — participants
+    // drag their windows around during a show — so a custom clip whose text-hash
+    // happens to resolve to a stale/foreign cache entry would compose from window
+    // boxes captured at a DIFFERENT moment (wrong positions AND swapped labels →
+    // the speaker's nameplate burned over someone else's face: the bug this fixes).
+    // The operator picked an exact window; detect it fresh at its own mid-frame.
+    const missing = resolvedCands.filter(c => args.clipAt || !windows[clipKey(c)]);
     if (!missing.length) {
       log(`  loaded cached windows`);
     } else {
@@ -524,7 +531,13 @@ async function main() {
         .filter(c => ![...named].some(s => labelsMatch(c.label, s)))
         .sort((a, b) => b.n - a.n);
       const anons = [...new Set(resolvedCands.flatMap(c => (c.speakers ?? []).map(s => s.speaker)).filter(anonish))];
-      if (anons.length === 1 && unclaimed.length && unclaimed[0]!.n >= 2 && (unclaimed.length === 1 || unclaimed[0]!.n >= 2 * unclaimed[1]!.n)) {
+      // Unambiguous when exactly ONE camera is unclaimed (the single-clip custom
+      // case: that camera appears once, so the old n>=2 bar could NEVER fire and
+      // the dominant anon speaker stayed unmatched -> the wrong face on top). With
+      // MULTIPLE unclaimed cameras keep the stricter evidence: the camera must
+      // recur (n>=2) and clearly dominate the runner-up.
+      const aliasable = anons.length === 1 && unclaimed.length >= 1 && (unclaimed.length === 1 || (unclaimed[0]!.n >= 2 && unclaimed[0]!.n >= 2 * unclaimed[1]!.n));
+      if (aliasable) {
         const from = anons[0]!;
         const to = unclaimed[0]!.label;
         for (const c of resolvedCands) {
