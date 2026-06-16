@@ -605,8 +605,11 @@ async function main() {
     burn: args.burn,
     vertical: args.vertical,
     layouts,
-    geomLayouts,
-    altLayouts,
+    // Custom clips render only the primary 9:16 (the geometry/speaker reframe the
+    // operator asked for) — skip the extra geometry + ALT takes: fewer ffmpeg
+    // steps, less render time, and less chance of being interrupted mid-flight.
+    geomLayouts: args.clipAt ? undefined : geomLayouts,
+    altLayouts: args.clipAt ? undefined : altLayouts,
     mobileBg,
     limit: args.limit,
     log: m => log(`  ${m}`),
