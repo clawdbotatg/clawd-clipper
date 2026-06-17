@@ -95,10 +95,14 @@ export async function writeGallery(opts: {
         <p class="reason">${esc(c.reason)}</p>
         ${c.critique ? `<p class="critique">⚖︎ ${esc(c.critique)}</p>` : ""}
         ${
-          c.tweetShort || c.tweetLong
+          c.tweetShort || c.tweetMedium || c.tweetLong
             ? `<div class="tweets">${
                 c.tweetShort
                   ? `<div class="tw"><div class="tw-h"><span>short</span><button class="copy" data-copy="${esc(c.tweetShort)}">copy</button></div><p class="tw-t">${esc(c.tweetShort)}</p></div>`
+                  : ""
+              }${
+                c.tweetMedium
+                  ? `<div class="tw"><div class="tw-h"><span>medium</span><button class="copy" data-copy="${esc(c.tweetMedium)}">copy</button></div><p class="tw-t">${esc(c.tweetMedium)}</p></div>`
                   : ""
               }${
                 c.tweetLong

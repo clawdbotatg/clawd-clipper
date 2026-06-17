@@ -42,8 +42,10 @@ export type ResolvedClip = {
   verdict?: "keep" | "cut";
   finalScore?: number; // blend of score + judgeScore used for the final rank
   captionText?: string; // context-corrected caption text (refine.ts), if it ran
-  // Filled in by the tweet pass (tweets.ts), if it ran — suggested post copy:
+  // Filled in by the tweet pass (tweets.ts), if it ran — suggested post copy,
+  // three options shortest to longest:
   tweetShort?: string; // one-line scroll-stopper
+  tweetMedium?: string; // 1-2 sentence single-tweet version
   tweetLong?: string; // 2-4 sentence version
   // Filled in by speaker attribution (speakers.ts), if a live transcript aligned:
   speaker?: string; // dominant speaker in the clip (handle/ENS, else short addr)

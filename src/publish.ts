@@ -36,6 +36,7 @@ export type ClipBundleEntry = {
   landscape?: { cid: string; format: string; sizeBytes: number; poster?: { cid: string; format: string } };
   captions?: { cid: string; format: string };
   tweetShort?: string;
+  tweetMedium?: string;
   tweetLong?: string;
 };
 
@@ -159,6 +160,7 @@ export async function publishClips(opts: {
       landscape,
       captions,
       tweetShort: c.tweetShort,
+      tweetMedium: c.tweetMedium,
       tweetLong: c.tweetLong,
     });
   }
