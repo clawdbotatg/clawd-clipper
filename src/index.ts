@@ -61,6 +61,10 @@ type Args = {
   publish: boolean;
   stitch: boolean;
   force: boolean;
+  // Force ONLY the tweet pass to re-run (ignore tweets.json), reusing every other
+  // cache. The cheap way to refresh post copy after a prompt change without a full
+  // --force re-download/re-transcribe.
+  regenTweets: boolean;
   // --clip-at: render ONE operator-chosen window instead of mining the episode.
   // Skips the LLM picker + judge + tweets; everything else (speakers, captions,
   // 9:16 reframe) runs as normal. clipTitle names the file; clipSnap=false
@@ -82,7 +86,7 @@ function parseClockTime(s: string): number {
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
-  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false, stitch: false, clipSnap: true };
+  const out: Partial<Args> = { force: false, judge: true, refine: true, burn: true, tweets: true, vertical: false, publish: false, stitch: false, clipSnap: true, regenTweets: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") out.force = true;
@@ -90,6 +94,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--no-refine") out.refine = false;
     else if (a === "--no-burn") out.burn = false;
     else if (a === "--no-tweets") out.tweets = false;
+    else if (a === "--regen-tweets") out.regenTweets = true; // re-run ONLY the tweet pass, reuse every other cache
     else if (a === "--vertical") out.vertical = true;
     else if (a === "--publish") ((out.publish = true), (out.vertical = true)); // publish pins the 9:16 clips → implies --vertical
     else if (a === "--stitch") out.stitch = true; // allow stitched (multi-span) clips
@@ -109,7 +114,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (!positional[0])
     throw new Error(
-      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--vertical] [--publish] [--stitch] [--force]\n" +
+      "usage: yarn clip <slug> [--manifest CID] [--limit N] [--target SEC] [--no-judge] [--no-refine] [--no-burn] [--no-tweets] [--regen-tweets] [--vertical] [--publish] [--stitch] [--force]\n" +
         "       yarn clip <slug> --clip-at 7:18-8:05 [--clip-title \"...\"] [--clip-exact]   # render ONE custom clip from an explicit window",
     );
   // A custom clip is a 9:16 reframe by definition (geometry + speaker tile is the
@@ -126,6 +131,7 @@ function parseArgs(argv: string[]): Args {
     publish: out.publish ?? false,
     stitch: out.stitch ?? false,
     force: out.force ?? false,
+    regenTweets: out.regenTweets ?? false,
     clipSnap: out.clipSnap ?? true,
   };
 }
@@ -360,7 +366,9 @@ async function main() {
     log(`\n▸ drafting post copy…`);
     const tweetPath = join(outDir, "tweets.json");
     let tweets: Tweets = {};
-    if (!args.force) {
+    // --regen-tweets (like --force) ignores tweets.json so the copy is rewritten;
+    // every other cache is still reused, so it's just one LLM call + re-publish.
+    if (!args.force && !args.regenTweets) {
       try {
         tweets = JSON.parse(await readFile(tweetPath, "utf8")) as Tweets;
       } catch {
