@@ -29,15 +29,35 @@ function client(): OpenAI {
   return (cachedClient ??= new OpenAI({ apiKey: config.openAiApiKey }));
 }
 
-async function transcribeChunk(path: string): Promise<VerboseJsonShape> {
-  const res = await client().audio.transcriptions.create({
-    file: createReadStream(path),
-    model: config.transcribeModel,
-    response_format: "verbose_json",
-    timestamp_granularities: ["word", "segment"],
-    language: "en",
-  });
-  return res as unknown as VerboseJsonShape;
+// One whisper call. The OpenAI audio endpoint throws on transient faults
+// (429 rate-limit, 5xx, socket timeout) and a single uncaught throw used to
+// kill the WHOLE run — an episode is ~30 sequential calls, so the odds that
+// every one lands first try are poor, and the relay only surfaced it as the
+// opaque "clipper exited 1". Retry with exponential backoff so a blip is
+// absorbed instead of aborting the episode. createReadStream is re-opened each
+// attempt (a consumed stream can't be replayed).
+async function transcribeChunk(path: string, onRetry?: (m: string) => void): Promise<VerboseJsonShape> {
+  const maxAttempts = 5;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await client().audio.transcriptions.create({
+        file: createReadStream(path),
+        model: config.transcribeModel,
+        response_format: "verbose_json",
+        timestamp_granularities: ["word", "segment"],
+        language: "en",
+      });
+      return res as unknown as VerboseJsonShape;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts) break;
+      const waitMs = Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+      onRetry?.(`whisper error (${err instanceof Error ? err.message : err}) — retry ${attempt}/${maxAttempts - 1} in ${(waitMs / 1000).toFixed(0)}s`);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
 }
 
 export async function transcribeVideo(opts: {
@@ -65,8 +85,25 @@ export async function transcribeVideo(opts: {
   const segments: Segment[] = [];
   for (let i = 0; i < chunks.length; i++) {
     const { path, offset } = chunks[i]!;
-    log(`  chunk ${i + 1}/${chunks.length} (offset ${offset.toFixed(1)}s)`);
-    const r = await transcribeChunk(path);
+    // Cache each chunk's whisper result next to its mp3 (chunk_0000.json). The
+    // mp3 segmentation is deterministic from the source, so a run that died
+    // partway resumes from the last good chunk instead of re-paying for every
+    // call from chunk 1. --force re-asks (skips + overwrites the cache).
+    const chunkCache = path.replace(/\.mp3$/, ".json");
+    let r: VerboseJsonShape | null = null;
+    if (!opts.force) {
+      try {
+        r = JSON.parse(await readFile(chunkCache, "utf8")) as VerboseJsonShape;
+        log(`  chunk ${i + 1}/${chunks.length} (offset ${offset.toFixed(1)}s) — cached`);
+      } catch {
+        /* no cache */
+      }
+    }
+    if (!r) {
+      log(`  chunk ${i + 1}/${chunks.length} (offset ${offset.toFixed(1)}s)`);
+      r = await transcribeChunk(path, m => log(`    ${m}`));
+      await writeFile(chunkCache, JSON.stringify(r));
+    }
     for (const w of r.words ?? []) {
       words.push({ start: w.start + offset, end: w.end + offset, word: w.word });
     }
